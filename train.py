@@ -3,7 +3,12 @@ import os
 import argparse
 import warnings
 import time
+import wandb
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix, average_precision_score
+import dotenv
+dotenv.load_dotenv()
+
+wandb.login(key=os.getenv("WANDB_API_KEY"))
 
 warnings.filterwarnings("ignore")
 
@@ -20,6 +25,9 @@ parser.add_argument('--node_emb_dim', type=int, default=8)
 parser.add_argument('--plm', type=str, default='bert')
 parser.add_argument('--plm_rep_dim', type=int, default=768)
 parser.add_argument('--source', type=str, default='gpt')
+parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
+parser.add_argument('--wandb_project', type=str, default='Geom', help='WandB project name')
+parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity name')
 
 args, unknown = parser.parse_known_args()
 print(args)
@@ -29,11 +37,29 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 from model import *
 from utils import *
 
-device = torch.device(
-    'cuda:0' if torch.cuda.is_available() else 'cpu')
+# Set device - try MPS first, then CUDA, then fall back to CPU
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print("Using MPS device")
+elif torch.cuda.is_available():
+    device = torch.device('cuda:0')
+    print("Using CUDA device")
+else:
+    device = torch.device('cpu')
+    print("Using CPU device")
+
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 torch.use_deterministic_algorithms(True)
+
+# Initialize wandb if enabled
+if args.use_wandb:
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        config=vars(args)
+    )
+    wandb.config.update({"device": str(device)})
 
 # Create model save path
 model_path = './models/'
@@ -186,7 +212,7 @@ for k in range(5):
     print('parameters:', count_parameters(model))
 
     # Cross-entropy loss, Adam optimizer
-    criterion = torch.nn.CrossEntropyLoss().cuda()
+    criterion = torch.nn.CrossEntropyLoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     # Upsample minority class
@@ -223,9 +249,9 @@ for k in range(5):
             idx1_batch = I1[n * int(batch_size / 2):(n + 1) * int(batch_size / 2)]
             idx = np.concatenate([idx0_batch, idx1_batch], axis=0)
             P, P_static, P_avg_interval, P_length, P_time, y = \
-                Ptrain_tensor[idx].cuda(), Ptrain_static_tensor[idx].cuda() if d_static != 0 else None, \
-                    Ptrain_avg_interval_tensor[idx].cuda(), Ptrain_length_tensor[idx].cuda(), \
-                    Ptrain_time_tensor[idx].cuda(), ytrain_tensor[idx].cuda()
+                Ptrain_tensor[idx].to(device), Ptrain_static_tensor[idx].to(device) if d_static != 0 else None, \
+                    Ptrain_avg_interval_tensor[idx].to(device), Ptrain_length_tensor[idx].to(device), \
+                    Ptrain_time_tensor[idx].to(device), ytrain_tensor[idx].to(device)
 
             # Backward pass
             outputs = model.forward(P, P_static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
@@ -246,18 +272,31 @@ for k in range(5):
         with torch.no_grad():
             out_val = evaluate_model(model, Pval_tensor, Pval_static_tensor, Pval_avg_interval_tensor,
                                         Pval_length_tensor, Pval_time_tensor, P_var_plm_rep_tensor,
-                                        n_classes=n_class, batch_size=batch_size)
+                                        n_classes=n_class, batch_size=batch_size, device=device)
             out_val = torch.squeeze(torch.sigmoid(out_val))
             out_val = out_val.detach().cpu().numpy()
             y_val_pred = np.argmax(out_val, axis=1)
             acc_val = np.sum(yval.ravel() == y_val_pred.ravel()) / yval.shape[0]
-            val_loss = torch.nn.CrossEntropyLoss().cuda()(torch.from_numpy(out_val), torch.from_numpy(yval.squeeze(1)).long())
+            val_loss = torch.nn.CrossEntropyLoss().to(device)(torch.from_numpy(out_val), torch.from_numpy(yval.squeeze(1)).long())
             auc_val = roc_auc_score(yval, out_val[:, 1])
             aupr_val = average_precision_score(yval, out_val[:, 1])
             print(
                 "Validation: Epoch %d, train_loss:%.4f, train_auprc:%.2f, train_auroc:%.2f, val_loss:%.4f, acc_val: %.2f, aupr_val: %.2f, auc_val: %.2f" %
                 (epoch, loss.item(), train_auprc * 100, train_auroc * 100,
                  val_loss.item(), acc_val * 100, aupr_val * 100, auc_val * 100))
+            
+            # Log metrics to wandb if enabled
+            if args.use_wandb:
+                wandb.log({
+                    "epoch": epoch,
+                    "train_loss": loss.item(),
+                    "train_auprc": train_auprc * 100,
+                    "train_auroc": train_auroc * 100,
+                    "val_loss": val_loss.item(),
+                    "val_acc": acc_val * 100,
+                    "val_auprc": aupr_val * 100,
+                    "val_auroc": auc_val * 100
+                })
 
             # Save the model weights with the best AUPRC on the validation set
             if aupr_val > best_aupr_val:
@@ -279,7 +318,7 @@ for k in range(5):
     with torch.no_grad():
         out_test = evaluate_model(model, Ptest_tensor, Ptest_static_tensor, Ptest_avg_interval_tensor,
                                   Ptest_length_tensor, Ptest_time_tensor, P_var_plm_rep_tensor,
-                                  n_classes=n_class,batch_size=batch_size).numpy()
+                                  n_classes=n_class, batch_size=batch_size, device=device).numpy()
         denoms = np.sum(np.exp(out_test.astype(np.float64)), axis=1).reshape((-1, 1))
         y_test = ytest.copy()
         probs = np.exp(out_test.astype(np.float64)) / denoms
@@ -291,6 +330,15 @@ for k in range(5):
         print('Testing: AUROC = %.2f | AUPRC = %.2f | Accuracy = %.2f' % (auc * 100, aupr * 100, acc * 100))
         print('classification report', classification_report(y_test, ypred))
         print(confusion_matrix(y_test, ypred, labels=list(range(n_class))))
+        
+        # Log test metrics to wandb if enabled
+        if args.use_wandb:
+            wandb.log({
+                "test_acc": acc * 100,
+                "test_auprc": aupr * 100,
+                "test_auroc": auc * 100,
+                "run": k,
+            })
 
     acc_arr.append(acc * 100)
     auprc_arr.append(aupr * 100)
@@ -305,3 +353,15 @@ print('------------------------------------------')
 print('Accuracy = %.1f±%.1f' % (mean_acc, std_acc))
 print('AUPRC    = %.1f±%.1f' % (mean_auprc, std_auprc))
 print('AUROC    = %.1f±%.1f' % (mean_auroc, std_auroc))
+
+# Log final metrics to wandb if enabled
+if args.use_wandb:
+    wandb.log({
+        "final_mean_acc": mean_acc,
+        "final_std_acc": std_acc,
+        "final_mean_auprc": mean_auprc,
+        "final_std_auprc": std_auprc,
+        "final_mean_auroc": mean_auroc,
+        "final_std_auroc": std_auroc
+    })
+    wandb.finish()

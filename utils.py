@@ -4,16 +4,16 @@ import numpy as np
 
 def evaluate_model(model, P_tensor, P_static_tensor, P_avg_interval_tensor,
                       P_length_tensor, P_time_tensor, P_var_prior_emb_tensor,
-                      batch_size=100, n_classes=2, static=None):
+                      batch_size=100, n_classes=2, static=None, device='cuda'):
     model.eval()
-    P_tensor = P_tensor.cuda()
-    P_time_tensor = P_time_tensor.cuda()
-    P_length_tensor = P_length_tensor.cuda()
-    P_avg_interval_tensor = P_avg_interval_tensor.cuda()
+    P_tensor = P_tensor.to(device)
+    P_time_tensor = P_time_tensor.to(device)
+    P_length_tensor = P_length_tensor.to(device)
+    P_avg_interval_tensor = P_avg_interval_tensor.to(device)
     if P_static_tensor is None:
         Pstatic = None
     else:
-        P_static_tensor = P_static_tensor.cuda()
+        P_static_tensor = P_static_tensor.to(device)
         N, Fs = P_static_tensor.shape
 
     N, F, Ff = P_tensor.shape

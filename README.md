@@ -1,3 +1,13 @@
+
+git clone git@github.com:rickconci/GeomMLProj.git
+cd GeomMLProj
+chmod +x setup_geomml.sh
+./setup_geomml.sh
+
+
+
+
+
 # Knowledge-Empowered Dynamic Graph Network for Irregularly Sampled Medical Time Series
 
 ## Overview
