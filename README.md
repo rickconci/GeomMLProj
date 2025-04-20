@@ -1,12 +1,127 @@
+# KEDGN: Knowledge-Enhanced Dynamic Graph Networks
 
-git clone git@github.com:rickconci/GeomMLProj.git
+This repository contains an implementation of KEDGN (Knowledge-Enhanced Dynamic Graph Networks) for multivariate time series classification. The model integrates pre-trained language model representations with graph neural networks to capture relationships between variables in irregularly-sampled time series.
+
+## Features
+
+- GRU-GCN (original model)
+- GRU-GAT (Graph Attention variant)
+- Transformer-GAT (Temporal transformer with graph attention)
+- Time-aware positional encodings for handling irregular time intervals
+- PyTorch Lightning integration for structured training
+- Weights & Biases logging
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/GeomMLProj.git
+cd GeomMLProj
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## Data
+
+The code supports several medical time series datasets:
+
+- PhysioNet (physionet)
+- MIMIC-III (mimic3)
+- P12
+- P19
+
+Place your datasets in the `data/` directory:
+
+```
+data/
+  physionet/
+  mimic3/
+  P12/
+  P19/
+```
+
+## Usage
+
+### Original Training Script
+
+```bash
+python train.py --dataset physionet --epochs 10 --batch_size 256 --hidden_dim 4
+```
+
+### PyTorch Lightning Training Script
+
+```bash
+python train_lightning.py --dataset physionet --epochs 10 --batch_size 256 --hidden_dim 4 --use_wandb
+```
+
+### Model Variants
+
+#### GRU-GCN (Original)
+
+```bash
+python train_lightning.py --dataset physionet
+```
+
+#### GRU-GAT
+
+```bash
+python train_lightning.py --dataset physionet --use_gat --num_heads 2
+```
+
+#### Transformer-GAT
+
+```bash
+python train_lightning.py --dataset physionet --use_transformer --history_len 15 --nhead_transformer 2 --use_gat --num_heads 2
+```
+
+## Command Line Arguments
+
+- `--dataset`: Dataset name ('physionet', 'P12', 'P19', 'mimic3')
+- `--epochs`: Number of training epochs
+- `--batch_size`: Batch size
+- `--lr`: Learning rate
+- `--hidden_dim`: Hidden dimension size
+- `--use_wandb`: Enable Weights & Biases logging
+- `--wandb_project`: WandB project name
+- `--wandb_entity`: WandB entity name
+- `--rarity_alpha`: Hyperparameter for node rarity
+- `--query_vector_dim`: Dimension of query vectors
+- `--node_emb_dim`: Dimension of node embeddings
+- `--use_gat`: Use Graph Attention Networks instead of GCN
+- `--num_heads`: Number of attention heads for GAT
+- `--use_adj_mask`: Use adjacency matrix as a mask for GAT attention
+- `--use_transformer`: Use transformer per variable instead of GRU
+- `--history_len`: History length for transformer model
+- `--nhead_transformer`: Number of attention heads in transformer
+- `--runs`: Number of runs with different seeds
+- `--seed`: Random seed
+
+## Model Architecture
+
+The KEDGN model combines several components:
+
+1. **Value and Time Encoders**: Process raw input values and timestamps
+2. **Variable-specific Parameter Generation**: Dynamically generates parameters for each variable
+3. **Graph Neural Network**: Either GCN or GAT for message passing between variables
+4. **Temporal Modeling**: Either GRU cells or Transformer blocks for processing the time dimension
+
+## Differences between GRU-GCN, GRU-GAT, and Transformer-GAT
+
+1. **GRU-GCN (Original)**: Uses GRU cells for temporal processing and Graph Convolutional Networks for variable interactions
+
+2. **GRU-GAT**: Replaces GCN with Graph Attention Networks to learn attention weights between variables
+
+3. **Transformer-GAT**:
+   - Replaces GRU with Transformer blocks for each variable
+   - Includes time-aware positional encodings for handling irregular sampling
+   - Maintains a history buffer for each variable
+   - Uses self-attention to focus on the most relevant past observations
+
+git clone <git@github.com>:rickconci/GeomMLProj.git
 cd GeomMLProj
 chmod +x setup_geomml.sh
 ./setup_geomml.sh
-
-
-
-
 
 # Knowledge-Empowered Dynamic Graph Network for Irregularly Sampled Medical Time Series
 
@@ -14,14 +129,12 @@ chmod +x setup_geomml.sh
 
 This repository contains implementation code for our NeurIPS 2024 paper: "*Knowledge-Empowered Dynamic Graph Network for Irregularly Sampled Medical Time Series*".
 
-We propose Knowledge-Empowered Dynamic Graph Network (KEDGN), a graph neural network empowered by variables’ textual medical information, aiming to model variable-specific temporal dependencies and inter-variable dependencies in ISMTS. 
+We propose Knowledge-Empowered Dynamic Graph Network (KEDGN), a graph neural network empowered by variables' textual medical information, aiming to model variable-specific temporal dependencies and inter-variable dependencies in ISMTS.
 We evaluate KEDGN on four healthcare datasets.
 
 ## The model framework of KEDGN
 
 ![model](model.png)
-
-
 
 ## Experimental settings
 
@@ -34,56 +147,52 @@ datasets.
 
 ### Raw data
 
-**(1)** The PhysioNet Sepsis Early Prediction Challenge 2019  dataset consists of medical records from 38,803 patients. Each patient's record includes 34 variables. For every patient, there is a static vector indicating attributes such as age, gender, the time interval between hospital admission and ICU admission, type of ICU, and length of stay in the ICU measured in days. Additionally, each patient is assigned a binary label indicating whether sepsis occurs within the subsequent 6 hours. We follow the procedures of \cite{zhang2021graph} to ensure certain samples with excessively short or long time series are excluded. The raw data is available at https://physionet.org/content/challenge-2019/1.0.0/
+**(1)** The PhysioNet Sepsis Early Prediction Challenge 2019  dataset consists of medical records from 38,803 patients. Each patient's record includes 34 variables. For every patient, there is a static vector indicating attributes such as age, gender, the time interval between hospital admission and ICU admission, type of ICU, and length of stay in the ICU measured in days. Additionally, each patient is assigned a binary label indicating whether sepsis occurs within the subsequent 6 hours. We follow the procedures of \cite{zhang2021graph} to ensure certain samples with excessively short or long time series are excluded. The raw data is available at <https://physionet.org/content/challenge-2019/1.0.0/>
 
-**(2)** The P12  dataset comprises data from 11,988 patients after 12 inappropriate samples identified by \cite{horn2020set} were removed from the dataset. Each patient's record in the P12 dataset includes multivariate time series data collected during their initial 48-hour stay in the ICU. The time series data consists of measurements from 36 sensors (excluding weight). Additionally, each sample is associated with a static vector containing 9 elements, including age, gender, and other relevant attributes. Furthermore, each patient in the P12 dataset is assigned a binary label indicating the length of their stay in the ICU. A negative label signifies a hospitalization period of three days or shorter, while a positive label indicates a hospitalization period exceeding three days.  Raw data of **P12** can be found at https://physionet.org/content/challenge-2012/1.0.0/.
+**(2)** The P12  dataset comprises data from 11,988 patients after 12 inappropriate samples identified by \cite{horn2020set} were removed from the dataset. Each patient's record in the P12 dataset includes multivariate time series data collected during their initial 48-hour stay in the ICU. The time series data consists of measurements from 36 sensors (excluding weight). Additionally, each sample is associated with a static vector containing 9 elements, including age, gender, and other relevant attributes. Furthermore, each patient in the P12 dataset is assigned a binary label indicating the length of their stay in the ICU. A negative label signifies a hospitalization period of three days or shorter, while a positive label indicates a hospitalization period exceeding three days.  Raw data of **P12** can be found at <https://physionet.org/content/challenge-2012/1.0.0/>.
 
-**(3)** MIMIC-III The MIMIC-III dataset is a widely used database that comprises de-identified Electronic Health Records of patients who were admitted to the ICU at Beth Israel Deaconess Medical Center from 2001 to 2012. Originally, it encompassed around 57,000 records of ICU patients, containing diverse variables such as medications, in-hospital mortality, and vital signs. Harutyunyan established a variety of benchmark tasks using a subset of this database. In our study, we focus on the binary in-hospital mortality prediction task to assess classification performance. Following preprocessing, our dataset consists of 16 features and 21,107 data points. It is available at https://physionet.org/content/mimiciii/1.4/
+**(3)** MIMIC-III The MIMIC-III dataset is a widely used database that comprises de-identified Electronic Health Records of patients who were admitted to the ICU at Beth Israel Deaconess Medical Center from 2001 to 2012. Originally, it encompassed around 57,000 records of ICU patients, containing diverse variables such as medications, in-hospital mortality, and vital signs. Harutyunyan established a variety of benchmark tasks using a subset of this database. In our study, we focus on the binary in-hospital mortality prediction task to assess classification performance. Following preprocessing, our dataset consists of 16 features and 21,107 data points. It is available at <https://physionet.org/content/mimiciii/1.4/>
 
-**(4)** Physionet contains the data from the first 48 hours of patients in ICU which is a reduced version of P12 considered by prior work. Therefore, we follow the same preprocessing methods as those used for the P12 dataset. The processed data set includes 3997 labeled instances. We focus on predicting in-hospital. It is available at https://physionet.org/content/challenge-2012/
+**(4)** Physionet contains the data from the first 48 hours of patients in ICU which is a reduced version of P12 considered by prior work. Therefore, we follow the same preprocessing methods as those used for the P12 dataset. The processed data set includes 3997 labeled instances. We focus on predicting in-hospital. It is available at <https://physionet.org/content/challenge-2012/>
 
 ### Processed data
 
-For dataset P19 and P12. We use the data processed by [Raindrop](https://github.com/mims-harvard/Raindrop). 
+For dataset P19 and P12. We use the data processed by [Raindrop](https://github.com/mims-harvard/Raindrop).
 
 The raw data can be found at:
 
-**(1)** P19: https://physionet.org/content/challenge-2019/1.0.0/
+**(1)** P19: <https://physionet.org/content/challenge-2019/1.0.0/>
 
-**(2)** P12: https://physionet.org/content/challenge-2012/1.0.0/
+**(2)** P12: <https://physionet.org/content/challenge-2012/1.0.0/>
 
 The datasets processed by [Raindrop](https://github.com/mims-harvard/Raindrop) can be obtained at:
 
-**(1)** P19 (PhysioNet Sepsis Early Prediction Challenge 2019) https://doi.org/10.6084/m9.figshare.19514338.v1
+**(1)** P19 (PhysioNet Sepsis Early Prediction Challenge 2019) <https://doi.org/10.6084/m9.figshare.19514338.v1>
 
-**(2)** P12 (PhysioNet Mortality Prediction Challenge 2012) https://doi.org/10.6084/m9.figshare.19514341.v1
+**(2)** P12 (PhysioNet Mortality Prediction Challenge 2012) <https://doi.org/10.6084/m9.figshare.19514341.v1>
 
 For the MIMIC-III dataset:
 
-1. Obtain the raw data from https://mimic.physionet.org/.
-2. Execute the mortality prediction data preprocessing program from https://github.com/YerevaNN/mimic3-benchmarks to obtain the .csv files.
-3. Run the data preprocessing code from https://github.com/ExpectationMax/medical_ts_datasets to obtain the .npy files.
+1. Obtain the raw data from <https://mimic.physionet.org/>.
+2. Execute the mortality prediction data preprocessing program from <https://github.com/YerevaNN/mimic3-benchmarks> to obtain the .csv files.
+3. Run the data preprocessing code from <https://github.com/ExpectationMax/medical_ts_datasets> to obtain the .npy files.
 
 For the PhysioNet dataset:
 
-1. Obtain the raw data from https://physionet.org/content/challenge-2012/1.0.0/. Use only the set-a portion.
+1. Obtain the raw data from <https://physionet.org/content/challenge-2012/1.0.0/>. Use only the set-a portion.
 
 2. Execute the preprocessing file in data/physionet/process_scripts/.
-
-   
 
 ## Requirements
 
 KEDGN has tested using Python 3.9.
 
-To have consistent libraries and their versions, you can install needed dependencies 
+To have consistent libraries and their versions, you can install needed dependencies
 for this project running the following command:
 
 ```
 pip install -r requirements.txt
 ```
-
-
 
 ## Running the code
 
@@ -128,7 +237,7 @@ Algorithms can be run with named arguments, which allow the use of different set
 
 ### Variable Semantic Representations Extraction
 
-- Download the corresponding pre-trained language model (PLM) offline files from Hugging Face (https://huggingface.co/).
+- Download the corresponding pre-trained language model (PLM) offline files from Hugging Face (<https://huggingface.co/>).
 
 - Move the downloaded files to the respective directory under /data/plm/.
 

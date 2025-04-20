@@ -28,6 +28,12 @@ parser.add_argument('--source', type=str, default='gpt')
 parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
 parser.add_argument('--wandb_project', type=str, default='Geom', help='WandB project name')
 parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity name')
+parser.add_argument('--use_gat', action='store_true', help='Use GAT attention instead of GCN')
+parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads for GAT')
+parser.add_argument('--use_adj_mask', action='store_true', help='Use adjacency matrix as a mask for GAT attention')
+parser.add_argument('--use_transformer', action='store_true', help='Use transformer per variable instead of GRU')
+parser.add_argument('--history_len', type=int, default=10, help='History length for transformer model')
+parser.add_argument('--nhead_transformer', type=int, default=2, help='Number of attention heads in transformer')
 
 args, unknown = parser.parse_known_args()
 print(args)
@@ -204,7 +210,13 @@ for k in range(5):
                   rarity_alpha=rarity_alpha,
                   query_vector_dim=query_vector_dim,
                   node_emb_dim=node_emb_dim,
-                  plm_rep_dim=plm_rep_dim)
+                  plm_rep_dim=plm_rep_dim,
+                  use_gat=args.use_gat,
+                  num_heads=args.num_heads,
+                  use_adj_mask=args.use_adj_mask,
+                  use_transformer=args.use_transformer,
+                  history_len=args.history_len,
+                  nhead_transformer=args.nhead_transformer)
 
 
     params = (list(model.parameters()))
