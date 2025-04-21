@@ -13,7 +13,7 @@ wandb.login(key=os.getenv("WANDB_API_KEY"))
 warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='physionet', choices=['P12', 'P19', 'physionet', 'mimic3'])
+parser.add_argument('--dataset', type=str, default='physionet', choices=['P12', 'P19', 'physionet', 'mimic3', 'mimic4'])
 parser.add_argument('--cuda', type=str, default='0')
 parser.add_argument('--epochs', type=int, default=10)  #
 parser.add_argument('--batch_size', type=int, default=256)
@@ -40,7 +40,7 @@ print(args)
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-from model import *
+from GeomMLProj.models import *
 from utils import *
 
 # Set device - try MPS first, then CUDA, then fall back to CPU
@@ -118,6 +118,14 @@ elif dataset == 'mimic3':
     timestamp_num = 292
     n_class = 2
     split_idx = 0
+elif dataset == 'mimic4':
+    base_path = 'data/mimic4'
+    start = 0
+    d_static = 2  # Adjust based on your static features
+    variables_num = 669  
+    timestamp_num = 96  
+    n_class = 2
+    split_idx = 0
 
 # Evaluation metrics
 acc_arr = []
@@ -151,6 +159,9 @@ for k in range(5):
     elif dataset == 'mimic3':
         split_path = ''
         P_var_plm_rep_tensor = torch.load(base_path + '/mimic3_' + args.plm + suffix).to(device)
+    elif dataset == 'mimic4':
+        split_path = '/splits/mimic4_split' + str(split_idx) + '.npy'
+        P_var_plm_rep_tensor = torch.load(base_path + '/mimic4_' + args.plm + suffix).to(device)
 
     # Prepare data and split the dataset
     Ptrain, Pval, Ptest, ytrain, yval, ytest = get_data_split(base_path, split_path, dataset=dataset)

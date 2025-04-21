@@ -67,7 +67,10 @@ class TimeSeriesDataset(Dataset):
         
         y_tensor = torch.tensor(self.labels[idx]).float()
         
-        return P_tensor, P_static_tensor, P_avg_interval_tensor, P_length_tensor, P_time_tensor, None, y_tensor
+        # Return empty tensor instead of None for placeholder position
+        placeholder_tensor = torch.tensor([])
+        
+        return P_tensor, P_static_tensor, P_avg_interval_tensor, P_length_tensor, P_time_tensor, placeholder_tensor, y_tensor
 
 
 # Lightning DataModule
@@ -192,9 +195,9 @@ class TimeSeriesDataModule(pl.LightningDataModule):
             prefetch_factor=2 if self.num_workers > 0 else None,
         )
     
-    def transfer_batch_to_device(self, batch, device):
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         # Override to add PLM representation to each batch
-        P, P_static, P_avg_interval, P_length, P_time, _, y = batch
+        P, P_static, P_avg_interval, P_length, P_time, placeholder_tensor, y = batch
         
         # Move all tensors to device
         P = P.to(device)

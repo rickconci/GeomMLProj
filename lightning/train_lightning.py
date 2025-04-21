@@ -28,8 +28,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/training.log'),
-        logging.StreamHandler()  # Keep console output too
+        logging.FileHandler('logs/training.log')
+        # Console output disabled
     ]
 )
 

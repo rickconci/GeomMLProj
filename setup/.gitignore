@@ -1,0 +1,12 @@
+*.iml
+*.xml
+*.bin
+*.model
+*.msgpack
+*.zip
+*.ipynb
+wandb/
+.env
+__pycache__/
+data/P19/splits/
+data/P19/processed_data/

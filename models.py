@@ -5,9 +5,216 @@ from utils import *
 from einops import *
 from einops import repeat
 import logging
+import math
+import os
+from transformers import AutoTokenizer, AutoModelForMaskedLM
 
-# Configure logging for debugging
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(message)s')
+
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print("Using MPS device")
+elif torch.cuda.is_available():
+    device = torch.device('cuda:0')
+    print("Using CUDA device")
+else:
+    device = torch.device('cpu')
+    print("Using CPU device")
+
+
+# Configure logging for debugging - file only, no console output
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='%(levelname)s:%(message)s',
+    handlers=[
+        logging.FileHandler('logs/models.log')
+    ]
+)
+
+
+class DSEncoderWithRNN(nn.Module):
+    def __init__(self, model_name="medicalai/ClinicalBERT", rnn_hidden_dim=768, projection_dim=1536):
+        """
+        model_name: Name of the pretrained ClinicalBERT model.
+        rnn_hidden_dim: Hidden size for the GRU (can be equal to the transformer hidden size).
+        projection_dim: Final dimension for contrastive learning, e.g. 2 * hidden_dim.
+        """
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.transformer = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
+        hidden_dim = self.transformer.config.hidden_size  # e.g., 768
+        
+        # GRU to process sequence of chunk embeddings.
+        self.gru = nn.GRU(
+            input_size=hidden_dim, 
+            hidden_size=rnn_hidden_dim, 
+            batch_first=True
+        )
+        
+        # Projection layer: maps the GRU output to your desired embedding dimension.
+        self.projection = nn.Sequential(
+            nn.Linear(rnn_hidden_dim, projection_dim),
+            nn.ReLU()  # Optional activation, adjust as needed.
+        )
+    
+    def forward(self, discharge_chunks, output_dim=None):
+        """
+        discharge_chunks: A list of samples.
+                          Each sample is a list of text chunks (strings).
+                          
+        output_dim: Optional output dimension override
+        
+        The function returns a tensor of shape [B, projection_dim or output_dim].
+        """
+        batch_size = len(discharge_chunks)
+        all_chunks = []   # To store all chunk texts across the batch.
+        sample_indices = []  # To track which sample each chunk belongs to.
+        
+        # If all chunks are empty, return a tensor of zeros
+        if all(len(chunks) == 0 for chunks in discharge_chunks):
+            if output_dim is None:
+                output_dim = self.projection[0].out_features
+            return torch.zeros(batch_size, output_dim, device=device)
+        
+        # Flatten the list of lists.
+        for i, chunks in enumerate(discharge_chunks):
+            for chunk in chunks:
+                all_chunks.append(chunk)
+                sample_indices.append(i)
+        
+        # If no chunks after filtering, return zeros
+        if len(all_chunks) == 0:
+            if output_dim is None:
+                output_dim = self.projection[0].out_features
+            return torch.zeros(batch_size, output_dim, device=device)
+        
+        # Tokenize all chunks in one call.
+        inputs = self.tokenizer(all_chunks, padding=True, truncation=True, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Process with ClinicalBERT using the approach that works
+        with torch.no_grad():
+            self.transformer.eval()  # Ensure model is in eval mode
+            outputs = self.transformer(**inputs, output_hidden_states=True)
+            # Extract embeddings from the last hidden state's first token (CLS)
+            last_hidden_states = outputs.hidden_states[-1]  # shape: (num_chunks, seq_len, hidden_size)
+            cls_embeddings = last_hidden_states[:, 0, :]  # shape: (num_chunks, hidden_size)
+        
+        # Reassemble the embeddings into per-sample lists
+        batch_embeddings = [[] for _ in range(batch_size)]
+        for idx, emb in zip(sample_indices, cls_embeddings):
+            batch_embeddings[idx].append(emb)
+        
+        # Process each sample separately
+        projected_embeddings = []
+        for i, embeddings in enumerate(batch_embeddings):
+            if not embeddings:
+                # If this sample has no embeddings, use zeros
+                if output_dim is None:
+                    output_dim = self.projection[0].out_features
+                projected_embeddings.append(torch.zeros(output_dim, device=device))
+                continue
+                
+            # Stack this sample's embeddings
+            sample_emb = torch.stack(embeddings, dim=0)  # [num_chunks, hidden_dim]
+            
+            # Process with GRU to handle variable number of chunks
+            _, h_n = self.gru(sample_emb.unsqueeze(0))  # Add batch dimension
+            
+            # Get final hidden state
+            final_state = h_n[0]  # [1, hidden_dim]
+            
+            # Project to final dimension
+            proj = self.projection(final_state.squeeze(0))  # [projection_dim]
+            projected_embeddings.append(proj)
+        
+        # Stack all sample embeddings
+        return torch.stack(projected_embeddings, dim=0)  # [batch_size, projection_dim]
+
+
+
+class ProjectionHead(torch.nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.projection = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, output_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(output_dim, output_dim)
+        )
+        
+    def forward(self, x):
+        return self.projection(x)
+
+
+
+
+def build_cluster_adjacencies(cluster_labels):
+    """
+    Build two sets of edge indices for fully connected networks:
+      (a) Intra-cluster connectivity: edges among sensors in the same cluster.
+      (b) Inter-cluster connectivity: edges among sensors in different clusters.
+
+    Args:
+        cluster_labels (torch.LongTensor): Shape [N], where N is the number of sensors.
+                                            Each element is an integer cluster id.
+
+    Returns:
+        edge_index_intra (torch.LongTensor): Shape [2, E_intra] for intra-cluster edges.
+        edge_index_inter (torch.LongTensor): Shape [2, E_inter] for inter-cluster edges.
+    """
+    device = cluster_labels.device
+    n_sensors = cluster_labels.size(0)
+
+    # Build a dictionary mapping cluster id to the indices of sensors in that cluster.
+    clusters = {}
+    unique_clusters = torch.unique(cluster_labels)
+    for c in unique_clusters.tolist():
+        clusters[c] = torch.nonzero(cluster_labels == c, as_tuple=True)[0]
+
+    # (1) Build Intra-Cluster Edge Index:
+    intra_edge_list = []
+    for c, indices in clusters.items():
+        if indices.numel() == 0:
+            continue
+        # Generate a fully connected graph for sensors in this cluster (excluding self-loops).
+        row = indices.view(-1, 1).repeat(1, indices.size(0)).view(-1)
+        col = indices.view(1, -1).repeat(indices.size(0), 1).view(-1)
+        # Remove self-loops (if not desired):
+        mask = row != col
+        row, col = row[mask], col[mask]
+        intra_edge_list.append(torch.stack([row, col], dim=0))
+    if intra_edge_list:
+        edge_index_intra = torch.cat(intra_edge_list, dim=1).unique(dim=1)
+    else:
+        edge_index_intra = torch.empty((2, 0), dtype=torch.long, device=device)
+
+    # (2) Build Inter-Cluster Edge Index:
+    inter_edge_list = []
+    unique_cluster_list = sorted(clusters.keys())
+    # For each pair of distinct clusters, generate fully connected edges
+    for i, c1 in enumerate(unique_cluster_list):
+        for c2 in unique_cluster_list[i+1:]:
+            indices1 = clusters[c1]
+            indices2 = clusters[c2]
+            if indices1.numel() == 0 or indices2.numel() == 0:
+                continue
+            # Create edges in one direction (from cluster c1 to c2)
+            row = indices1.view(-1, 1).repeat(1, indices2.size(0)).view(-1)
+            col = indices2.view(1, -1).repeat(indices1.size(0), 1).view(-1)
+            edges_c1c2 = torch.stack([row, col], dim=0)
+            # Create the reverse direction (from c2 to c1)
+            edges_c2c1 = torch.stack([col, row], dim=0)
+            inter_edge_list.append(edges_c1c2)
+            inter_edge_list.append(edges_c2c1)
+    if inter_edge_list:
+        edge_index_inter = torch.cat(inter_edge_list, dim=1).unique(dim=1)
+    else:
+        edge_index_inter = torch.empty((2, 0), dtype=torch.long, device=device)
+
+    return edge_index_intra.to(device), edge_index_inter.to(device)
+
+
+
 
 
 class Value_Encoder(nn.Module):
@@ -82,9 +289,12 @@ class AGATCellWithMLP(nn.Module):
         self.num_heads = num_heads
         # The +1 accounts for the rarity score that's concatenated to the input x
         combined_dim = 2 * input_size + 1  # x+rarity_score + h 
-        self.attentions = nn.ModuleList([
-            nn.Linear(2 * combined_dim, 1) for _ in range(num_heads)
-        ])
+        
+        # More memory-efficient GAT implementation
+        self.query = nn.ModuleList([nn.Linear(combined_dim, combined_dim // 8) for _ in range(num_heads)])
+        self.key = nn.ModuleList([nn.Linear(combined_dim, combined_dim // 8) for _ in range(num_heads)])
+        self.value = nn.ModuleList([nn.Linear(combined_dim, combined_dim) for _ in range(num_heads)])
+        
         self.use_adj_mask = use_adj_mask
         logging.info("AGATCellWithMLP initialized with input_size {}, actual combined dim {}, and query_vector_dim {}, num_heads {}, use_adj_mask: {}"
                      .format(input_size, combined_dim, query_vector_dim, num_heads, use_adj_mask))
@@ -104,27 +314,20 @@ class AGATCellWithMLP(nn.Module):
         combined = torch.cat([x, h], dim=-1)  # Shape: [num_nodes, 2*input_size]
         logging.debug("Combined input and hidden shape: {}".format(combined.shape))
         
-        # 2. GAT ATTENTION INSTEAD OF GCN
+        # 2. MEMORY-EFFICIENT GAT ATTENTION
         # Multi-head attention computation
         attention_outputs = []
         
-        # Attention heads compute message passing weights
+        # Process each attention head separately to save memory
         for head in range(self.num_heads):
-            # Direct attention implementation without loops
-            # For each src node i and target node j:
-            # Stack src_node_feature (repeated for each target) and tgt_node_features
-            src_nodes = combined.unsqueeze(2).repeat(1, 1, combined.size(1), 1)  # [B, N, N, F]
-            tgt_nodes = combined.unsqueeze(1).repeat(1, combined.size(1), 1, 1)  # [B, N, N, F]
+            # Transform features to queries and keys, reducing dimensions for efficiency
+            queries = self.query[head](combined)  # [B, N, dim//8]
+            keys = self.key[head](combined)       # [B, N, dim//8]
+            values = self.value[head](combined)   # [B, N, dim]
             
-            # Concatenate along feature dimension
-            node_pairs = torch.cat([src_nodes, tgt_nodes], dim=-1)  # [B, N, N, 2F]
-            
-            # Reshape for linear layer
-            node_pairs_flat = node_pairs.view(-1, node_pairs.size(-1))  # [B*N*N, 2F]
-            
-            # Compute attention scores
-            attn_flat = self.attentions[head](node_pairs_flat)  # [B*N*N, 1]
-            attn_scores = attn_flat.view(combined.size(0), combined.size(1), combined.size(1))  # [B, N, N]
+            # Compute attention scores with matrix multiplication
+            # (B, N, dim//8) @ (B, dim//8, N) -> (B, N, N)
+            attn_scores = torch.bmm(queries, keys.transpose(1, 2)) / math.sqrt(queries.size(-1))
             
             # Apply leaky ReLU
             attn_scores = F.leaky_relu(attn_scores, 0.2)
@@ -137,7 +340,7 @@ class AGATCellWithMLP(nn.Module):
             attention = F.softmax(attn_scores, dim=2)
             
             # Apply attention weights to get node features
-            h_prime = torch.bmm(attention, combined)
+            h_prime = torch.bmm(attention, values)
             attention_outputs.append(h_prime)
         
         # Average across attention heads
@@ -624,6 +827,11 @@ class KEDGN(nn.Module):
             P_length: Tensor, lengths of the time series for each batch element [B, 1].
             P_time: Tensor of timestamps [B, T, V] (or [B, T]).
             P_var_plm_rep_tensor: Tensor of pre-trained language model embeddings for each variable [B, V, plm_rep_dim]
+            
+        Returns:
+            output: Classification logits [B, n_class]
+            aggregated_hidden: Aggregated hidden state [B, V]
+            fused_features: Features for contrastive learning [B, V*2] or [B, V]
         """
         # Logging input shapes
         logging.debug("Input P shape: {}".format(P.shape))
@@ -672,10 +880,12 @@ class KEDGN(nn.Module):
             logging.debug("Fused feature shape (hidden + static): {}".format(fused_features.shape))
             output = self.classifier(fused_features)
         else:
+            fused_features = aggregated_hidden
             output = self.classifier(aggregated_hidden)
         
         logging.info("Output shape: {}".format(output.shape))
-        return output
+        # Return classification output, aggregated state, and intermediate representation
+        return output, aggregated_hidden, fused_features
 
 class VariableTransformerCell(nn.Module):
     def __init__(self, input_size, hidden_size, nhead=2, dim_feedforward=64, dropout=0.1):
