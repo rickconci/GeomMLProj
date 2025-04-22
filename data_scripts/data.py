@@ -12,6 +12,7 @@ import nltk
 from nltk.tokenize import word_tokenize
 import re
 nltk.download('punkt')
+from datetime import timedelta
 
 import lmdb
 
@@ -110,6 +111,7 @@ class MIMICDemographicsLoader:
         self.merged_with_disch_df.to_pickle(pickle_path)
         print("Processed DataFrame saved to:", pickle_path)
 
+
     def get_30_day_mortality_outcome(self, outcome_choice):
         if outcome_choice == '30d_mortality_discharge':
             hadm_disch_death = self.merged_with_disch_df.groupby('hadm_id').first()[['dischtime', 'dod']].copy()
@@ -127,9 +129,7 @@ class MIMICDemographicsLoader:
             )
             return hadm_disch_death
 
-        if outcome_choice == '48h_mortality':
-            pass
-
+       
     def get_hadm_ids(self):
         """Get a list of all hadm_ids that have discharge notes."""
         if self.merged_with_disch_df is None:
@@ -1091,46 +1091,39 @@ class MIMICEventGroupsCache:
 
 
 class MIMICContrastivePairsDataset(Dataset):
-    def __init__(self, event_processor, 
-                 disch_notes_processor, 
-                 splits_loader=None, 
-                 split='train', 
-                 itemid_list=None, 
-                 T=96,
-                 cache_dir='./cache'):
-        """
-        Dataset for MIMIC paired time series and discharge summary data intended for contrastive learning.
-        Creates natural pairs of time series and corresponding discharge summaries for each admission.
-        
-        Args:
-            event_processor: MIMICClinicalEventsProcessor instance with loaded event data
-            disch_notes_processor: processor for discharge notes
-            splits_loader: splits loader (optional)
-            split: One of 'train', 'val', 'test'
-            itemid_list: List of itemids to include in time series data. If None, uses all.
-            T: Number of time steps for physiologic data
-            cache_dir: Directory to cache the processed events
-        """
+    def __init__(
+        self, 
+        event_processor, 
+        disch_notes_processor, 
+        splits_loader=None, 
+        split='train', 
+        itemid_list=None, 
+        T=96,
+        cache_dir='./cache',
+        task_mode='CONTRASTIVE',   # <-- 'CONTRASTIVE' or 'NEXT_24h'
+        chunk_hours=12,            # Hours to expand input window each step
+        label_window=24            # Next-24-hour mortality window
+    ):
         self.event_processor = event_processor
         self.disch_notes_processor = disch_notes_processor
-
         self.events_cache = MIMICEventGroupsCache(cache_dir)
-    
+
         self.splits_loader = splits_loader
         self.split = split
         self.T = T
-        
-        # Get hadm_ids for this split
+        self.task_mode = task_mode
+        self.chunk_hours = chunk_hours
+        self.label_window = label_window
+
+        # 1) Load hadm_ids for this split
         if splits_loader is not None and splits_loader.train_hadm_ids is not None:
             self.hadm_ids = splits_loader.get_split_hadm_ids(split)
         else:
-            # Fallback to using all hadm_ids if splits not defined
             self.hadm_ids = list(event_processor.hadm_ids)
             print(f"Warning: No split data found. Using all {len(self.hadm_ids)} hadm_ids for {split}.")
-        
-        # Get itemid list
+
+        # 2) Set or discover itemid_list
         if itemid_list is None:
-            # Use all unique itemids from all event sources
             all_itemids = set()
             for df_name in ['chartevents_filtered', 'labevents_filtered']:
                 if hasattr(event_processor, df_name):
@@ -1141,43 +1134,148 @@ class MIMICContrastivePairsDataset(Dataset):
         else:
             self.itemid_list = itemid_list
 
+        # 3) Build self.samples
+        if self.task_mode == 'NEXT_24h':
+            self.samples = []
+            for hadm_id in self.hadm_ids:
+                # Grab admission, discharge, death times from merged_with_disch_df
+                meta = self.event_processor.merged_with_disch_df[
+                    self.event_processor.merged_with_disch_df['hadm_id'] == hadm_id
+                ]
+                if meta.empty:
+                    # If we don't have times, skip
+                    continue
+
+                row = meta.iloc[0]
+                admittime = pd.to_datetime(row['admittime'], errors='coerce')
+                deathtime = pd.to_datetime(row['deathtime'], errors='coerce') \
+                            if 'deathtime' in row and not pd.isnull(row['deathtime']) else None
+                dischtime = pd.to_datetime(row['dischtime'], errors='coerce') \
+                            if 'dischtime' in row and not pd.isnull(row['dischtime']) else None
+
+                # If the patient died, define chunk cutoff as (deathtime - 24h).
+                # Otherwise, define chunk cutoff as dischtime.
+                if deathtime is not None:
+                    chunk_end_cutoff = deathtime - pd.Timedelta(hours=24)
+                else:
+                    if dischtime is None:
+                        # If no discharge time in the data, skip or set fallback
+                        continue
+                    chunk_end_cutoff = dischtime  
+
+                # In some edge cases, chunk_end_cutoff could be earlier than admittime
+                # (e.g., a patient who died <24h after admission). In that scenario,
+                # you could skip or handle differently:
+                if chunk_end_cutoff <= admittime:
+                    # No meaningful chunk
+                    continue
+
+                i = 1
+                while True:
+                    # chunk_end_time is how far we go for the *input window*
+                    chunk_end_time = admittime + pd.Timedelta(hours=self.chunk_hours * i)
+
+                    # Once we exceed the cutoff, stop creating further chunks
+                    if chunk_end_time > chunk_end_cutoff:
+                        break
+
+                    # Determine the next-24-hour window: [chunk_end_time, chunk_end_time + 24h)
+                    label_start_time = chunk_end_time
+                    label_end_time = chunk_end_time + pd.Timedelta(hours=self.label_window)
+
+                    # Mortality label if deathtime falls in that next 24h window
+                    if deathtime is not None and (label_start_time <= deathtime < label_end_time):
+                        label = 1
+                    else:
+                        label = 0
+
+                    self.samples.append((hadm_id, i, label))
+                    i += 1
+
+        else:
+            # 'CONTRASTIVE' mode: single sample per hadm_id
+            self.samples = self.hadm_ids
+
     def __len__(self):
-        return len(self.hadm_ids)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        hadm_id = self.hadm_ids[idx]
-    
-        baseline_tensor, physio_df, treatments_df = self.get_events_for_hadm_groups(hadm_id)
-        discharge_chunks = self.disch_notes_processor.get_discharge_chunks(hadm_id)
-        
-        physio_tensor, mask_tensor, time_hours_tensor, length = self.pivot_and_pad_physio(physio_df, self.itemid_list, T=self.T)
-                
-        sample = {
-            'hadm_id': hadm_id,
-            'physio_tensor': physio_tensor,       
-            'mask_tensor': mask_tensor,  
-            'time_hours_tensor': time_hours_tensor, 
-            'length': length,
-            'baseline_tensor': baseline_tensor,
-            'treatments_df': treatments_df,
-            'discharge_chunks': discharge_chunks,
-        }
+        if self.task_mode == 'CONTRASTIVE':
+            # Standard approach
+            hadm_id = self.samples[idx]
+            baseline_tensor, physio_df, treatments_df = self.get_events_for_hadm_groups(hadm_id)
+            discharge_chunks = self.disch_notes_processor.get_discharge_chunks(hadm_id)
 
-        return sample
-    
+            physio_tensor, mask_tensor, time_hours_tensor, length = \
+                self.pivot_and_pad_physio(physio_df, self.itemid_list, T=self.T)
 
+            return {
+                'hadm_id': hadm_id,
+                'physio_tensor': physio_tensor,
+                'mask_tensor': mask_tensor,
+                'time_hours_tensor': time_hours_tensor,
+                'length': length,
+                'baseline_tensor': baseline_tensor,
+                'treatments_df': treatments_df,
+                'discharge_chunks': discharge_chunks,
+            }
+        elif self.task_mode == '24h_mortality':
+            # NEXT_24h mode
+            hadm_id, chunk_index, label = self.samples[idx]
+            # chunk_index means 0->(12 * chunk_index) input window
+            chunk_end_hr = self.chunk_hours * chunk_index
+
+            # All events
+            baseline_tensor, physio_df, treatments_df = self.get_events_for_hadm_groups(hadm_id)
+            #discharge_chunks = self.disch_notes_processor.get_discharge_chunks(hadm_id)
+
+            # Restrict physio data to the input window up to chunk_end_hr from admission
+            meta = self.select_if_exists(self.event_processor.merged_with_disch_df, hadm_id)
+            row = meta.iloc[0]
+            admittime = pd.to_datetime(row['admittime'], errors='coerce')
+            cutoff_time = admittime + pd.Timedelta(hours=chunk_end_hr)
+
+            if not physio_df.empty:
+                physio_df = physio_df.copy()
+                physio_df['charttime'] = pd.to_datetime(physio_df['charttime'], errors='coerce')
+                physio_df = physio_df[physio_df['charttime'] <= cutoff_time]
+
+            # Pivot/pad
+            physio_tensor, mask_tensor, time_hours_tensor, length = \
+                self.pivot_and_pad_physio(physio_df, self.itemid_list, T=self.T)
+
+            return {
+                'hadm_id': hadm_id,
+                'physio_tensor': physio_tensor,
+                'mask_tensor': mask_tensor,
+                'time_hours_tensor': time_hours_tensor,
+                'length': length,
+                'baseline_tensor': baseline_tensor,
+                'treatments_df': treatments_df,
+                'discharge_chunks': None,
+                'chunk_index': chunk_index,
+                'label_24h_mortality': label
+            }
+        else:
+            raise ValueError(f"Invalid task mode: {self.task_mode}")
+    
+    def select_if_exists(self, df, hadm_id):
+        if df is None:
+            return None
+
+        if df.index.name == 'hadm_id' and hadm_id in df.index:
+            return df.loc[[hadm_id]]
+        elif 'hadm_id' in df.columns:
+            filtered = df[df['hadm_id'] == hadm_id]
+            return filtered if not filtered.empty else None
+        else:
+            return None
+    
     def get_events_for_hadm_groups(self, hadm_id):
         # Check cache first
         cached = self.events_cache.load(hadm_id)
         if cached is not None:
             return cached
-
-        # Process as before:
-        def select_if_exists(df):
-            if df is not None and hasattr(df, 'index') and hadm_id in df.index:
-                return df.loc[[hadm_id]]
-            else:
-                return None
             
         baseline_tensor = self.process_baseline(hadm_id)
             
@@ -1190,7 +1288,7 @@ class MIMICContrastivePairsDataset(Dataset):
             
         physio_dfs = []
         for df, source_name in physio_sources:
-            tmp = select_if_exists(df)
+            tmp = self.select_if_exists(df, hadm_id)
             if tmp is not None:
                 tmp = tmp.copy()
                 tmp['source'] = source_name
@@ -1213,7 +1311,7 @@ class MIMICContrastivePairsDataset(Dataset):
             
         treatment_dfs = []
         for df, source_name in treatment_sources:
-            tmp = select_if_exists(df)
+            tmp = self.select_if_exists(df, hadm_id)
             if tmp is not None:
                 tmp = tmp.copy()
                 tmp['source'] = source_name

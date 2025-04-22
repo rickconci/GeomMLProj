@@ -9,12 +9,17 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import dotenv
-from utils import contrastive_loss
-from models import DSEncoderWithRNN
+from utils import contrastive_loss, count_parameters, detailed_count_parameters, plot_first_sample, plot_mask_heatmap
+from models.main_models import KEDGN, DSEncoderWithRNN
+from models.models_utils import ProjectionHead
+
 dotenv.load_dotenv()
 
 # Import our wrapper around MIMICContrastivePairsDataset
-from dataloader_wrapper import MIMIC4KedgnWrapper
+from dataloader_mimic_iv import MIMIC4KedgnWrapper
+
+import pickle
+import pathlib
 
 wandb.login(key=os.getenv("WANDB_API_KEY"))
 
@@ -22,6 +27,8 @@ warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='mimic4', choices=['P12', 'P19', 'physionet', 'mimic3', 'mimic4'])
+parser.add_argument('--task_mode', type=str, default='CONTRASTIVE', choices=['CONTRASTIVE', '24h_mortality'])
+
 parser.add_argument('--cuda', type=str, default='0')
 parser.add_argument('--epochs', type=int, default=10)
 parser.add_argument('--batch_size', type=int, default=4)
@@ -33,15 +40,13 @@ parser.add_argument('--node_emb_dim', type=int, default=8)
 parser.add_argument('--plm', type=str, default='bert')
 parser.add_argument('--plm_rep_dim', type=int, default=768)
 parser.add_argument('--source', type=str, default='gpt')
-parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
-parser.add_argument('--wandb_project', type=str, default='Geom', help='WandB project name')
-parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity name')
+
 parser.add_argument('--use_gat', action='store_true', help='Use GAT attention instead of GCN')
 parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads for GAT')
 parser.add_argument('--use_adj_mask', action='store_true', help='Use adjacency matrix as a mask for GAT attention')
-parser.add_argument('--use_transformer', action='store_true', help='Use transformer per variable instead of GRU')
-parser.add_argument('--history_len', type=int, default=10, help='History length for transformer model')
-parser.add_argument('--nhead_transformer', type=int, default=2, help='Number of attention heads in transformer')
+
+parser.add_argument('--use_clusters', action='store_true', help='Use clusters instead of GRU')
+
 # Arguments for our dataloader wrapper
 parser.add_argument('--base_path', type=str, default='/Users/riccardoconci/Local_documents/!!MIMIC',
                     help='Path to MIMIC-IV data')
@@ -59,13 +64,23 @@ parser.add_argument('--similarity_metric', type=str, default='cosine', choices=[
 parser.add_argument('--temperature', type=float, default=0.1, help='Temperature for contrastive loss')
 parser.add_argument('--proj_dim', type=int, default=128, help='Projection dimension for contrastive embeddings')
 
+# Replace the existing batch-related arguments with a streamlined testing_mode option
+parser.add_argument('--use_cached_batch', action='store_true', help='Use a cached batch for testing instead of loading all data')
+parser.add_argument('--save_batch', action='store_true', help='Save a batch to disk for future testing')
+parser.add_argument('--testing_mode', action='store_true', help='Run in testing mode: uses a single cached batch for quicker model testing')
+parser.add_argument('--plot_first_batch_vars', action='store_true', help='Plot the first batch variables')
+
+
+parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
+parser.add_argument('--wandb_project', type=str, default='Geom', help='WandB project name')
+parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity name')
+
+
 args, unknown = parser.parse_known_args()
 print(args)
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-from models import *
-from utils import count_parameters
 
 # Set device - try MPS first, then CUDA, then fall back to CPU
 if torch.backends.mps.is_available():
@@ -136,15 +151,71 @@ for k in range(5):
     torch.cuda.manual_seed(k)
     np.random.seed(k)
 
-    # Load data using our custom wrapper
-    print(f"\nCreating dataloaders for run {k+1}/5...")
-    train_loader, val_loader, test_loader, P_var_plm_rep_tensor = MIMIC4KedgnWrapper.get_dataloaders(
-        base_path=args.base_path,
-        temp_dfs_path=args.temp_dfs_path,
-        batch_size=batch_size,
-        num_workers=args.num_workers,
-        outcome_choice=args.outcome_choice
-    )
+    # Check if testing mode is enabled
+    if args.testing_mode:
+        cached_batch_path = pathlib.Path(f'cache/sample_batch_{args.dataset}.pkl')
+        cached_batch_path.parent.mkdir(exist_ok=True, parents=True)
+        
+        
+        # Try to load cached batch if it exists
+        if cached_batch_path.exists():
+            print(f"Testing mode: Loading cached batch from {cached_batch_path}")
+            with open(cached_batch_path, 'rb') as f:
+                cached_data = pickle.load(f)
+                sample_batch = cached_data['batch']
+                P_var_plm_rep_tensor = cached_data['P_var_plm_rep_tensor'].to(device)
+                variables_num = cached_data['variables_num']
+            
+            
+        else:
+            # Save the first batch if no cached batch exists
+            print(f"Testing mode: Creating and saving sample batch")
+            sample_batch = next(iter(train_loader))
+            # Save to disk
+            with open(cached_batch_path, 'wb') as f:
+                pickle.dump({
+                    'batch': sample_batch,
+                    'P_var_plm_rep_tensor': P_var_plm_rep_tensor.cpu(),
+                    'variables_num': variables_num,
+                }, f)
+            print(f"Sample batch saved to {cached_batch_path}")
+
+        cluster_labels = torch.randint(0, 10, (variables_num,))
+        print('cluster_labels:', cluster_labels.shape)
+        
+        # Create single-batch loaders for all datasets
+        class SingleBatchLoader:
+            def __init__(self, batch):
+                self.batch = batch
+                self.dataset = type('DummyDataset', (), {'__len__': lambda self: batch['values'].shape[0]})()
+                
+            def __iter__(self):
+                yield self.batch
+                
+            def __len__(self):
+                return 1
+        
+        # Replace all three loaders with the single batch
+        train_loader = val_loader = test_loader = SingleBatchLoader(sample_batch)
+        print(f"Testing mode: Using single batch for all dataloaders (variables_num={variables_num})")
+
+    else:
+        # Load data using our custom wrapper
+        print(f"\nCreating dataloaders for run {k+1}/5...")
+        train_loader, val_loader, test_loader, P_var_plm_rep_tensor, cluster_labels = MIMIC4KedgnWrapper.get_dataloaders(
+            base_path=args.base_path,
+            temp_dfs_path=args.temp_dfs_path,
+            batch_size=batch_size,
+            num_workers=args.num_workers,
+            outcome_choice=args.outcome_choice,
+            task_mode=args.task_mode
+        )
+
+    
+    if args.plot_first_batch_vars:
+        sample_batch = next(iter(train_loader))
+        plot_first_sample(sample_batch, use_mask=True, plot_static=True)
+        plot_mask_heatmap(sample_batch)
     
     # Move variable embeddings to device
     P_var_plm_rep_tensor = P_var_plm_rep_tensor.to(device)
@@ -159,8 +230,10 @@ for k in range(5):
     # The tensor is [T, F] or [B, T, F], we need to figure out which
     if len(values.shape) == 3:  # [B, T, F]
         actual_feature_dim = values.shape[2]
+        actual_ts_dim = values.shape[1]
     else:  # [T, F]
         actual_feature_dim = values.shape[1]
+        actual_ts_dim = values.shape[0]
         
     # Adjust variables_num if it doesn't match the actual data
     if actual_feature_dim != variables_num:
@@ -195,16 +268,16 @@ for k in range(5):
                   use_gat=args.use_gat,
                   num_heads=args.num_heads,
                   use_adj_mask=args.use_adj_mask,
-                  use_transformer=args.use_transformer,
-                  history_len=args.history_len,
-                  nhead_transformer=args.nhead_transformer)
+                  use_clusters=args.use_clusters,
+                  cluster_labels=cluster_labels,
+                  task_mode=args.task_mode)
 
     # If using contrastive learning, add text encoder and projection heads
     if args.use_contrastive:
         text_encoder = DSEncoderWithRNN().to(device)  
-        
-        ts_projection = ProjectionHead(hidden_dim*2, args.proj_dim).to(device)
-        text_projection = ProjectionHead(hidden_dim*2, args.proj_dim).to(device)
+        # Use the correct dimension for projection heads
+        ts_projection = ProjectionHead(actual_ts_dim, args.proj_dim).to(device)
+        text_projection = ProjectionHead(1536, args.proj_dim).to(device)  # DSEncoder output is 1536
         
         # Add these components to the model for easier management
         model.text_encoder = text_encoder
@@ -216,8 +289,18 @@ for k in range(5):
 
     print('model parameters:', count_parameters(model))
     
+    # Add detailed parameter counting
+    param_details = detailed_count_parameters(model)
+    print("\nDetailed model parameters breakdown:")
+    for module_name, param_count in param_details.items():
+        if module_name != 'total':  # Skip total since we already print it
+            print(f"{module_name}: {param_count:,} ({param_count/param_details['total']*100:.1f}%)")
+    
     if args.use_contrastive != True:
         classification_criterion = torch.nn.CrossEntropyLoss().to(device)
+    if args.task_mode == '24h_mortality_discharge':
+        classification_criterion = torch.nn.BCEWithLogitsLoss().to(device)
+    
     
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -308,20 +391,33 @@ for k in range(5):
                 # No classification probabilities for contrastive learning
                 probs = None
             else:
-                # Standard classification forward pass
-                outputs = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
+                # Standard classification forward pass - unpack tuple returned by model
+                outputs, _, _ = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
                 
-                # Compute classification loss
-                loss = classification_criterion(outputs, labels.squeeze(1).long())
+                if args.task_mode == '24h_mortality_discharge':
+                    # Compute classification loss - labels should be float for BCEWithLogitsLoss
+                    loss = classification_criterion(outputs, labels.float())
+                    # Store probabilities for metrics
+                    probs = torch.sigmoid(outputs)
+                    # For binary classification with BCEWithLogitsLoss, create 2-column tensor for metrics
+                    probs_two_class = torch.cat([1-probs, probs], dim=1)
+                    train_probs_all.append(probs_two_class.detach().cpu())
+                else:
+                    # Compute classification loss
+                    loss = classification_criterion(outputs, labels.squeeze(1).long())
+                    # Store probabilities for metrics
+                    probs = torch.softmax(outputs, dim=1)
+                    train_probs_all.append(probs.detach().cpu())
                 
-                # Store probabilities for metrics
-                probs = torch.softmax(outputs, dim=1)
-                train_probs_all.append(probs.detach().cpu())
                 train_labels_all.append(labels.detach().cpu())
             
             # Update model parameters
             optimizer.zero_grad()
             loss.backward()
+            
+            # Add gradient clipping to prevent exploding gradients and NaN values
+            #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             train_loss += loss.item()
@@ -408,14 +504,21 @@ for k in range(5):
                     outputs = linear_classifier(ts_intermediate_rep)
                     probs = torch.softmax(outputs, dim=1)
                 else:
-                    # Standard classification forward pass
-                    outputs = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
+                    # Standard classification forward pass - unpack tuple returned by model
+                    outputs, _, _ = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
                     
-                    # Compute classification loss
-                    loss = classification_criterion(outputs, labels.squeeze(1).long())
-                    
-                    # Calculate probabilities
-                    probs = torch.softmax(outputs, dim=1)
+                    if args.task_mode == '24h_mortality_discharge':
+                        # Compute classification loss - labels should be float for BCEWithLogitsLoss
+                        loss = classification_criterion(outputs, labels.float())
+                        # Calculate probabilities
+                        probs = torch.sigmoid(outputs)
+                        # For binary classification with BCEWithLogitsLoss, create 2-column tensor for metrics
+                        probs = torch.cat([1-probs, probs], dim=1)
+                    else:
+                        # Compute classification loss
+                        loss = classification_criterion(outputs, labels.squeeze(1).long())
+                        # Calculate probabilities
+                        probs = torch.softmax(outputs, dim=1)
                 
                 val_loss += loss.item()
                 
@@ -518,11 +621,17 @@ for k in range(5):
                 linear_classifier = torch.nn.Linear(hidden_dim*2, n_class).to(device)
                 outputs = linear_classifier(ts_intermediate_rep)
             else:
-                # Standard classification forward pass
-                outputs = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
+                # Standard classification forward pass - unpack tuple returned by model
+                outputs, _, _ = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
             
             # Calculate probabilities
-            probs = torch.softmax(outputs, dim=1)
+            if args.task_mode == '24h_mortality_discharge':
+                probs = torch.sigmoid(outputs)
+                # For binary classification with BCEWithLogitsLoss, create 2-column tensor for metrics
+                probs = torch.cat([1-probs, probs], dim=1)
+            else:
+                probs = torch.softmax(outputs, dim=1)
+            
             test_probs_all.append(probs.detach().cpu())
             test_labels_all.append(labels.detach().cpu())
         

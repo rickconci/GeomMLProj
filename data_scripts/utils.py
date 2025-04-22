@@ -29,9 +29,6 @@ def log_message(*args, print_to_console=False):
         print(message)
 
 
-
-
-
 class ConvNetMLP(nn.Module):
     def __init__(self, hidden_size, final_dim, kernel_size=3):
         """

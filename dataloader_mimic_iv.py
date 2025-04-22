@@ -5,6 +5,7 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from data_scripts.generate_variable_embeddings import VariableEmbeddingGenerator
+from torch.utils.data._utils.collate import default_collate
 
 from data_scripts.data import (
     MIMICDemographicsLoader,
@@ -16,30 +17,29 @@ from data_scripts.data import (
 # Custom collate function to handle variable-sized discharge chunks
 def custom_collate_fn(batch):
     """
-    Custom collate function that handles variable-sized discharge_chunks.
-    
-    For discharge_chunks, we'll keep it as a list of lists, rather than trying to batch it.
-    For all other elements, we'll use the default collation.
+    Custom collate function that:
+      - If 'discharge_chunks' is present, we keep it as a list-of-lists and collate everything else with standard logic.
+      - If 'discharge_chunks' is NOT present (e.g., in NEXT_24h mode), we just do a default_collate.
     """
-    elem = batch[0]
-    result = {}
+    # If the first sample doesn't have 'discharge_chunks', we assume none of them do
+    if 'discharge_chunks' not in batch[0]:
+        # Just do the normal PyTorch collation
+        return default_collate(batch)
     
-    # Handle discharge_chunks specially
-    discharge_chunks = [item['discharge_chunks'] for item in batch]
-    result['discharge_chunks'] = discharge_chunks
+    # Otherwise, handle discharge_chunks specially
+    discharge_chunks = [sample['discharge_chunks'] for sample in batch]
     
-    # Handle all other elements with standard batching
-    for key in elem:
-        if key != 'discharge_chunks':
-            if isinstance(elem[key], torch.Tensor):
-                result[key] = torch.stack([item[key] for item in batch])
-            elif isinstance(elem[key], (int, float)):
-                result[key] = torch.tensor([item[key] for item in batch])
-            else:
-                # Handle any other types if needed
-                result[key] = [item[key] for item in batch]
+    # We remove discharge_chunks from each sample so that default_collate doesn't choke
+    # trying to stack them. Then we collate the remainder normally.
+    for sample in batch:
+        sample.pop('discharge_chunks', None)
     
-    return result
+    collated = default_collate(batch)
+    
+    # Re-insert discharge_chunks into the collated dictionary
+    collated['discharge_chunks'] = discharge_chunks
+    
+    return collated
 
 class MIMIC4KedgnWrapper(Dataset):
     """
@@ -115,6 +115,7 @@ class MIMIC4KedgnWrapper(Dataset):
             cls._event_processor.merged_with_disch_df = cls._demo_loader.merged_with_disch_df
             
         cls._event_processor.process_events()
+        cls._cluster_labels  = cls._event_processor.cluster_labels
         
         # Print some information after processing
         print(f"Number of hadm_ids after processing: {len(cls._demo_loader.get_hadm_ids())}")
@@ -160,7 +161,8 @@ class MIMIC4KedgnWrapper(Dataset):
                  outcome_choice='30d_mortality_discharge',
                  use_existing_temp_dfs=True,
                  cache_dir='./cache',
-                 T=96):
+                 T=96, 
+                 task_mode='CONTRASTIVE'):
         """
         Initialize MIMIC4KedgnWrapper.
         
@@ -180,7 +182,7 @@ class MIMIC4KedgnWrapper(Dataset):
         self.use_existing_temp_dfs = use_existing_temp_dfs
         self.cache_dir = cache_dir
         self.T = T
-        
+        self.task_mode = task_mode
         os.makedirs(self.cache_dir, exist_ok=True)
         
         # Initialize shared data components if not already done
@@ -190,8 +192,8 @@ class MIMIC4KedgnWrapper(Dataset):
         self._initialize_dataset()
     
     def _initialize_dataset(self):
-        """Initialize dataset for a specific split"""
-        print(f"Creating MIMICContrastivePairsDataset for {self.split} split...")
+        """Initialize dataset for this split."""
+        print(f"Creating MIMICContrastivePairsDataset for {self.split} split, task_mode={self.task_mode} ...")
         
         # Get outcome data
         self.outcome_df = self.__class__._demo_loader.get_30_day_mortality_outcome(self.outcome_choice)
@@ -203,13 +205,14 @@ class MIMIC4KedgnWrapper(Dataset):
             self.__class__._demo_loader,
             split=self.split,
             T=self.T,
-            cache_dir=self.temp_dfs_path if self.use_existing_temp_dfs else self.cache_dir
+            cache_dir=self.temp_dfs_path if self.use_existing_temp_dfs else self.cache_dir, 
+            task_mode=self.task_mode  
         )
         
         # Store hospital admission IDs for this split
-        self.hadm_ids = self.dataset.hadm_ids
-        print(f"Found {len(self.hadm_ids)} samples in {self.split} split")
-    
+        self.hadm_ids = self.dataset.hadm_ids  # In NEXT_24h mode, each hadm_id can appear multiple times in `samples`
+        print(f"Found {len(self.hadm_ids)} hadm_ids in {self.split} split; dataset size = {len(self.dataset)} samples.")
+        
     def __len__(self):
         """Return the number of samples in the dataset"""
         return len(self.dataset)
@@ -217,54 +220,67 @@ class MIMIC4KedgnWrapper(Dataset):
     def __getitem__(self, idx):
         """
         Get a sample and format it for KEDGN model
-        
         Returns a dictionary with keys needed by KEDGN model
         """
-        # Get the sample from the wrapped dataset
+        # Get the sample from the MIMICContrastivePairsDataset
         sample = self.dataset[idx]
         
+        # Grab the hadm_id directly from the sample
+        hadm_id = sample['hadm_id']
+        
         # Extract the components we need
-        physio_tensor = sample['physio_tensor']  # [T, F]
-        mask_tensor = sample['mask_tensor']      # [T, F]
-        baseline_tensor = sample['baseline_tensor'] if 'baseline_tensor' in sample else None
-        time_hours_tensor = sample['time_hours_tensor']  # [T]
-        length = sample['length']
-        hadm_id = self.hadm_ids[idx]
-        discharge_chunks = sample['discharge_chunks']
+        physio_tensor = sample['physio_tensor']    # [T, F]
+        mask_tensor = sample['mask_tensor']        # [T, F]
+        baseline_tensor = sample.get('baseline_tensor', None)  # [D] or None
+        time_hours_tensor = sample['time_hours_tensor']        # [T]
+        length = sample['length']                  # scalar
+        discharge_chunks = sample.get('discharge_chunks', None)
         
-        # For debugging, print shape info for the first item
-        if idx == 0:
-            print(f"First sample - physio_tensor shape: {physio_tensor.shape}")
-            print(f"First sample - mask_tensor shape: {mask_tensor.shape}")
-            print(f"First sample - time_hours_tensor shape: {time_hours_tensor.shape}")
-        
-        # Get label from outcome dataframe
-        if hadm_id in self.outcome_df.index:
-            label = self.outcome_df.loc[hadm_id, 'label_death_within_30d']
+        # If chunk-based, get the next-24h label
+        # Otherwise, get 30d mortality from outcome_df
+        if self.task_mode == 'NEXT_24h':
+            # the dataset sample already has 'label_24h_mortality'
+            label_24h = sample['label_24h_mortality']  # 0 or 1
+            label = torch.tensor(label_24h, dtype=torch.float).unsqueeze(0)  # shape [1]
         else:
-            # Default to negative class if not found
-            label = 0
-        
-        # Format for KEDGN model - keep time_hours_tensor as is [T]
-        # The repeat operation will happen in train_with_wrapper.py
+            # 'CONTRASTIVE' mode: we rely on your existing outcome_df
+            # e.g., outcome_df.loc[hadm_id, 'label_death_within_30d'] if it exists
+            if hadm_id in self.outcome_df.index:
+                val = self.outcome_df.loc[hadm_id, 'label_death_within_30d']
+                label = torch.tensor(val, dtype=torch.float).unsqueeze(0)
+            else:
+                label = torch.tensor(0, dtype=torch.float).unsqueeze(0)
+
+        # (Optional) debug info for the first item
+        if idx == 0:
+            print(f"[{self.split}] Sample idx=0 => hadm_id={hadm_id}")
+            print(f"  physio_tensor.shape: {physio_tensor.shape}")
+            print(f"  mask_tensor.shape:   {mask_tensor.shape}")
+            print(f"  time_hours_tensor.shape: {time_hours_tensor.shape}")
+            print(f"  label.shape: {label.shape}, label={label.item()}")
+
         return {
             'id': idx,
-            'values': physio_tensor,        # [T, F]
-            'mask': mask_tensor,            # [T, F]
-            'static': baseline_tensor,      # [D]
-            'times': time_hours_tensor,     # [T]
-            'length': length,               # scalar
-            'label': torch.tensor(label, dtype=torch.float).unsqueeze(0),  # [1]
+            'hadm_id': hadm_id,         # might be helpful for debugging
+            'values': physio_tensor,    # [T, F]
+            'mask': mask_tensor,        # [T, F]
+            'static': baseline_tensor,  # [D] or None
+            'times': time_hours_tensor, # [T]
+            'length': length,           # scalar
+            'label': label,             # [1]
             'discharge_chunks': discharge_chunks
         }
-    
     def get_variable_embeddings(self):
         """Get embeddings for clinical variables"""
         return self.__class__._var_embeddings
     
+    def get_cluster_labels(self):
+        """Get cluster labels for clinical variables"""
+        return self.__class__._cluster_labels
+    
     @staticmethod
     def get_dataloaders(base_path, temp_dfs_path='temp_dfs', batch_size=256, 
-                        num_workers=4, outcome_choice='30d_mortality_discharge'):
+                        num_workers=4, outcome_choice='30d_mortality_discharge', task_mode='CONTRASTIVE'):
         """
         Create DataLoader objects for train, validation, and test sets
         
@@ -276,7 +292,7 @@ class MIMIC4KedgnWrapper(Dataset):
             outcome_choice: Which outcome to predict
             
         Returns:
-            Tuple of (train_loader, val_loader, test_loader, var_embeddings)
+            Tuple of (train_loader, val_loader, test_loader, var_embeddings, cluster_labels)
         """
         print(f"\nCreating dataloaders for run 1/5...")
         
@@ -288,7 +304,8 @@ class MIMIC4KedgnWrapper(Dataset):
             base_path=base_path,
             temp_dfs_path=temp_dfs_path,
             split='train',
-            outcome_choice=outcome_choice
+            outcome_choice=outcome_choice,
+            task_mode=task_mode
         )
         
         print("Creating validation dataset...")
@@ -296,7 +313,8 @@ class MIMIC4KedgnWrapper(Dataset):
             base_path=base_path,
             temp_dfs_path=temp_dfs_path,
             split='val',
-            outcome_choice=outcome_choice
+            outcome_choice=outcome_choice,
+            task_mode=task_mode
         )
         
         print("Creating test dataset...")
@@ -304,7 +322,8 @@ class MIMIC4KedgnWrapper(Dataset):
             base_path=base_path,
             temp_dfs_path=temp_dfs_path,
             split='test',
-            outcome_choice=outcome_choice
+            outcome_choice=outcome_choice,
+            task_mode=task_mode
         )
         
         # Create DataLoaders with custom collate function
@@ -338,4 +357,7 @@ class MIMIC4KedgnWrapper(Dataset):
         # Get variable embeddings (will be the same for all splits)
         var_embeddings = MIMIC4KedgnWrapper._var_embeddings
         
-        return train_loader, val_loader, test_loader, var_embeddings 
+        # Get cluster labels
+        cluster_labels = MIMIC4KedgnWrapper._cluster_labels
+        
+        return train_loader, val_loader, test_loader, var_embeddings, cluster_labels
