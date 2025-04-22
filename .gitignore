@@ -5,3 +5,4 @@ temp_dfs/
 wandb/
 *__pycache__/
 *data/
+.env 
