@@ -95,7 +95,18 @@ def custom_collate_fn(batch):
     return collated
 
 
-def get_dataloaders(base_path, temp_dfs_path='temp_dfs', batch_size=64, 
+def get_var_embeddings(data_path, temp_dfs_path):
+    """
+    Get variable embeddings for MIMIC-IV data
+    """
+    print("Loading variable names...")
+    var_names = pickle.load(open(os.path.join(temp_dfs_path, 'var_names.pkl'), 'rb'))
+    print("Generating embeddings...")
+    embeddings, descriptions = VariableEmbeddingGenerator(data_path, temp_dfs_path).generate_embeddings(var_names)
+    return embeddings, descriptions
+
+
+def get_dataloaders(data_path, temp_dfs_path='temp_dfs', batch_size=64, 
                     num_workers=12, task_mode='CONTRASTIVE'):
     """
     Create DataLoader objects for train, validation, and test sets
@@ -112,67 +123,45 @@ def get_dataloaders(base_path, temp_dfs_path='temp_dfs', batch_size=64,
     print(f"\nCreating dataloaders for {task_mode} mode...")
     
     # Initialize shared data components first (only happens once)
+    embeddings, _ = get_var_embeddings(data_path, temp_dfs_path)
 
-
+    dataset_kwargs = dict(
+        cache_dir=temp_dfs_path,
+        task_mode=task_mode,
+        chunk_hours=12,
+        label_window=24,
+    )
     print("Creating train dataset...")
-    train_dataset = MIMICContrastivePairsDatasetLite(
-        base_path=base_path,
-        temp_dfs_path=temp_dfs_path,
-        split='train',
-        task_mode=task_mode
-    )
-    
+    train_dataset = MIMICContrastivePairsDatasetLite(split='train',  **dataset_kwargs)
     print("Creating validation dataset...")
-    val_dataset = MIMICContrastivePairsDatasetLite(
-        base_path=base_path,
-        temp_dfs_path=temp_dfs_path,
-        split='val',
-        task_mode=task_mode
-    )
-    
+    val_dataset   = MIMICContrastivePairsDatasetLite(split='val',    **dataset_kwargs)
     print("Creating test dataset...")
-    test_dataset = MIMICContrastivePairsDatasetLite(
-        base_path=base_path,
-        temp_dfs_path=temp_dfs_path,
-        split='test',
-        task_mode=task_mode
-    )
-    
-    # Create DataLoaders with custom collate function
-    train_loader = DataLoader(
-        train_dataset,
+    test_dataset  = MIMICContrastivePairsDatasetLite(split='test',   **dataset_kwargs)
+
+    # Base kwargs
+    loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True, 
-        prefetch_factor=2, 
-        collate_fn=custom_collate_fn, 
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2, 
         collate_fn=custom_collate_fn,
     )
+
+    if num_workers > 0:
+        loader_kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
+
+    # validation and test typically shuffle=False
+    val_kwargs = loader_kwargs.copy()
+    val_kwargs['shuffle'] = False
+    test_kwargs = val_kwargs.copy()
+
+    val_loader = DataLoader(val_dataset, **val_kwargs)
+    test_loader = DataLoader(test_dataset, **test_kwargs)
+
+    return train_loader, val_loader, test_loader, embeddings
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2, 
-        collate_fn=custom_collate_fn,
-    )
-    
-    # Get variable embeddings (will be the same for all splits)
-    var_embeddings = MIMIC4KedgnWrapper._var_embeddings
-    
-    return train_loader, val_loader, test_loader, var_embeddings

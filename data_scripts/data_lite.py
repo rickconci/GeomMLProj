@@ -32,7 +32,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
                  split='train', 
                  cache_dir='./cache', 
                  task_mode='CONTRASTIVE',
-                 chunk_hours=24,
+                 chunk_hours=12,
                  label_window=24):
         self.split = split
         self.cache_dir = cache_dir
@@ -92,7 +92,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             except Exception as e:
                 print(f"Failed to load cache: {e}; recomputing...")
         
-        df = self.splits_loader.merged_with_disch_df.copy()
+        df = self.merged_with_disch_df.copy()
         df['admittime'] = pd.to_datetime(df['admittime'], errors='coerce')
         if 'dischtime' in df.columns:
             df['dischtime'] = pd.to_datetime(df['dischtime'], errors='coerce')
@@ -235,7 +235,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             # First, try to load chunk cache.
             chunk_cache_dir = os.path.join(self.cache_dir, "next24h_chunk_cache")
             os.makedirs(chunk_cache_dir, exist_ok=True)
-            tensor_cache_key = f"next24h_{hadm_id}_{chunk_index}_{self.T}.pt"
+            tensor_cache_key = f"next24h_{hadm_id}_{chunk_index}.pt"
             tensor_cache_path = os.path.join(chunk_cache_dir, tensor_cache_key)
             chunk_load_start = time.time()
             if os.path.exists(tensor_cache_path):

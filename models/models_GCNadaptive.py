@@ -9,17 +9,7 @@ import math
 import os
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from models.models_utils import MLP, MLP_Param
-
-
-if torch.backends.mps.is_available():
-    device = torch.device('mps')
-    print("Using MPS device")
-elif torch.cuda.is_available():
-    device = torch.device('cuda:0')
-    print("Using CUDA device")
-else:
-    device = torch.device('cpu')
-    print("Using CPU device")
+from utils import device
 
 
 # Configure logging for debugging - file only, no console output

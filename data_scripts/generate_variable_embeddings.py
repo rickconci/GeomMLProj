@@ -5,12 +5,12 @@ import argparse
 import json
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForMaskedLM
-
+import pickle
 # Import our custom modules
 from data_scripts.LLM_utils import run_LLM
 
 class VariableEmbeddingGenerator:
-    def __init__(self, base_path, temp_dfs_path, model_name="medicalai/ClinicalBERT"):
+    def __init__(self, data_path, temp_dfs_path, model_name="medicalai/ClinicalBERT"):
         """
         Initialize the variable embedding generator.
         
@@ -19,7 +19,7 @@ class VariableEmbeddingGenerator:
             temp_dfs_path: Path to directory with existing processed files
             model_name: Name of the pretrained ClinicalBERT model
         """
-        self.base_path = base_path
+        self.data_path = data_path
         self.temp_dfs_path = temp_dfs_path
         self.model_name = model_name
         
@@ -114,48 +114,67 @@ class VariableEmbeddingGenerator:
         print(f"Saved {len(descriptions)} variable descriptions to {output_path}")
         return descriptions
     
-    def generate_embeddings(self, descriptions, output_file="mimic4_bert_var_rep_gpt_source.pt"):
+    def generate_embeddings(self,
+            var_names,
+            output_file="mimic4_bert_var_rep_gpt_source.pt",
+            batch_size=32,
+            pooling="cls",              # "cls" or "mean"
+        ):
         """
-        Generate embeddings for clinical variables using descriptions and ClinicalBERT.
-        
-        Args:
-            descriptions: Dictionary mapping variable names to descriptions
-            output_file: Path to save the variable embeddings
-        
-        Returns:
-            Tensor of variable embeddings
+        Generate ClinicalBERT embeddings for the provided variable names.
+
+        Returns
+        -------
+        embeddings : torch.Tensor
+            Shape (len(var_names), hidden_size)
+        descriptions : dict
+            Variable → description mapping (same as returned by self.generate_descriptions)
         """
-        # Check if embeddings file already exists
+        self.var_names = var_names                    # remember for later calls
+        descriptions = self.generate_descriptions(var_names)
+
         output_path = os.path.join(self.temp_dfs_path, output_file)
         if os.path.exists(output_path):
             print(f"Loading existing embeddings from {output_path}")
-            return torch.load(output_path)
-        
-        print("Generating embeddings for variables using ClinicalBERT...")
-        
-        # Create embeddings for all variables
-        embeddings = []
-        for var_name in tqdm(self.var_names):
-            # Get description for this variable
-            description = descriptions.get(var_name, f"Clinical measurement: {var_name}")
-            
-            # Tokenize the description
-            inputs = self.tokenizer(description, return_tensors="pt", padding=True, truncation=True)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # Get embedding from ClinicalBERT
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                # Use CLS token embedding as the variable representation
-                embedding = outputs.last_hidden_state[:, 0, :].cpu()
-            
-            embeddings.append(embedding)
-        
-        # Stack embeddings into a single tensor
-        embeddings_tensor = torch.cat(embeddings, dim=0)
-        
-        # Save embeddings to file
+            return torch.load(output_path), descriptions
+
+        print(f"Generating embeddings in batches of {batch_size}...")
+
+        # Pre-assemble description strings in input order
+        text_list = [
+            descriptions.get(v, f"Clinical measurement: {v}")
+            for v in self.var_names
+        ]
+
+        all_embs = []
+        self.model.eval()
+        with torch.no_grad():
+            for start in tqdm(range(0, len(text_list), batch_size)):
+                batch_text = text_list[start:start + batch_size]
+
+                tok = self.tokenizer(
+                    batch_text,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt"
+                ).to(self.device)
+
+                out = self.model(**tok, output_hidden_states=True)
+                last_layer = out.hidden_states[-1]        # (B, L, H)
+
+                if pooling == "cls":
+                    emb = last_layer[:, 0, :]             # [CLS]
+                elif pooling == "mean":
+                    # mask-aware mean: ignore padding tokens
+                    mask = tok["attention_mask"].unsqueeze(-1)  # (B, L, 1)
+                    emb = (last_layer * mask).sum(1) / mask.sum(1)
+                else:
+                    raise ValueError("pooling must be 'cls' or 'mean'")
+
+                all_embs.append(emb.cpu())
+
+        embeddings_tensor = torch.cat(all_embs, dim=0)    # (N, H)
         torch.save(embeddings_tensor, output_path)
-        
-        print(f"Saved embeddings with shape {embeddings_tensor.shape} to {output_path}")
-        return embeddings_tensor
+        print(f"Saved embeddings of shape {embeddings_tensor.shape} → {output_path}")
+
+        return embeddings_tensor, descriptions
