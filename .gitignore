@@ -2,6 +2,7 @@ logs/
 data/
 cache/
 temp_dfs/
+temp_dfs_lite/
 wandb/
 *__pycache__/
 *data/
