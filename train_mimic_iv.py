@@ -15,11 +15,11 @@ from models.models_utils import ProjectionHead
 from tqdm import tqdm 
 import json
 from pathlib import Path
-from utils import device
+from utils import device, log_batch_metrics
 
 from dataloader_lite import get_dataloaders
 
-DEBUG_PRINTS = True
+DEBUG_PRINTS = False
 def debug_print(*args, **kwargs):
         if DEBUG_PRINTS:
             print(*args, **kwargs)
@@ -71,6 +71,7 @@ def main(args):
     learning_rate = args.lr
     num_epochs = args.epochs
     hidden_dim = args.hidden_dim
+    projection_dim = args.projection_dim
     rarity_alpha = args.rarity_alpha
     query_vector_dim = args.query_vector_dim
     node_emb_dim = args.node_emb_dim
@@ -87,6 +88,9 @@ def main(args):
 
     # Run five experiments
     for k in range(5):
+
+       
+
         # Set different random seed for each run
         torch.manual_seed(k)
         torch.cuda.manual_seed(k)
@@ -147,9 +151,14 @@ def main(args):
             raise ValueError("No valid batches found - check your cache directory and dataset.")
 
         d_static = static.shape[1]
-        n_class = labels.shape[1]
         variables_num = values.shape[2]
         actual_ts_dim = values.shape[1]    
+
+        # Handle n_class differently based on task mode
+        if args.task_mode == 'NEXT_24h':
+            n_class = 1
+        else:
+            n_class = labels.shape[1]  # For other modes, get from data
 
         # Check if P_var_plm_rep_tensor matches variables_num and resize if needed
         if P_var_plm_rep_tensor.shape[0] != variables_num:
@@ -190,19 +199,13 @@ def main(args):
         debug_print(f"KEDGN model initialized in {time.time() - start_time:.2f} seconds")
         
         # If using contrastive learning, add text encoder and projection heads
-        if args.use_contrastive:
-            text_encoder = DSEncoderWithRNN().to(device)  
-            # Use the correct dimension for projection heads
-            ts_projection = ProjectionHead(actual_ts_dim, args.proj_dim).to(device)
-            text_projection = ProjectionHead(1536, args.proj_dim).to(device)  # DSEncoder output is 1536
-            
-            # Add these components to the model for easier management
-            model.text_encoder = text_encoder
-            model.ts_projection = ts_projection
-            model.text_projection = text_projection
+        if args.task_mode == 'CONTRASTIVE':
+            # Re-add Text encoder initialization
+            DS_encoder_projector = DSEncoderWithRNN(rnn_hidden_dim = hidden_dim, projection_dim = projection_dim).to(device)  
+        
+            model.text_encoder = DS_encoder_projector
             model.temperature = args.temperature
             model.similarity_metric = args.similarity_metric
-            model.contrastive_method = args.contrastive_method
 
         print('model parameters:', count_parameters(model))
         
@@ -214,10 +217,15 @@ def main(args):
                 print(f"{module_name}: {param_count:,} ({param_count/param_details['total']*100:.1f}%)")
 
         print('setting loss criterion')
-        if args.use_contrastive != True:
+        if args.task_mode != 'CONTRASTIVE':
             classification_criterion = torch.nn.CrossEntropyLoss().to(device)
         if args.task_mode == 'NEXT_24h':
-            classification_criterion = torch.nn.BCEWithLogitsLoss().to(device)
+            num_pos = sum(labels)
+            num_neg = len(labels) - num_pos
+            orig_ratio = num_neg / num_pos   
+            alpha = 0.5
+            pos_weight = torch.tensor(orig_ratio**alpha).to(device)  
+            classification_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight).to(device)
         
         print('setting up optimiser')
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -258,6 +266,15 @@ def main(args):
         save_time = str(int(time.time()))
         model_saved = False
 
+        running = {
+            'loss':0.0, 'TP':0, 'TN':0, 'FP':0, 'FN':0, 'seen':0,
+            'probs':[], 'labs':[]
+        }
+        global_step = 0
+        log_every   = 15
+
+
+        
         print('starting training')
         for epoch in range(start_epoch, num_epochs):
             if early_stop and args.early_stopping:
@@ -275,7 +292,7 @@ def main(args):
             print('initializing training iterator')
             train_iterator = tqdm(enumerate(train_loader), total=len(train_loader), 
                                 desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
-            print('training iterator initialized in', time.time() - start_time)
+            debug_print('training iterator initialized in', time.time() - start_time)
 
             for batch_idx, batch in train_iterator:
                 # Get data from batch and move to device
@@ -306,13 +323,13 @@ def main(args):
                 
                 P_length = length.unsqueeze(1)  # Shape [B, 1]
                 batch_computation_time = time.time() - start_batch_time
-                print('batch reshaping time:', batch_computation_time)
+                debug_print('batch reshaping time:', batch_computation_time)
                 
                 # Forward pass through the model
                 start_forward_time = time.time()
-                if args.use_contrastive and args.task_mode == 'CONTRASTIVE':
-                    # Get discharge text chunks for contrastive learning
-                    discharge_chunks = batch['discharge_chunks']
+                if args.task_mode == 'CONTRASTIVE':
+                    # Get discharge text chunks (not precomputed embeddings)
+                    discharge_embeddings = batch['discharge_embeddings']
                     
                     # Forward pass to get base KEDGN representations
                     # The KEDGN model now returns (output, aggregated_hidden, fused_features)
@@ -339,13 +356,17 @@ def main(args):
                     # Standard classification forward pass - unpack tuple returned by model
                     outputs, _, _ = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
                     forward_time = time.time() - start_forward_time
-                    print('forward pass time:', forward_time)
+                    debug_print('forward pass time:', forward_time)
                     
                     if args.task_mode == 'NEXT_24h':
                         # For NEXT_24h, ensure outputs are of shape [B, 1] to match labels
                         # If outputs are [B, 2], take only the positive class logits
                         if outputs.shape[1] == 2:
                             outputs = outputs[:, 1].unsqueeze(1)  # Get positive class logits
+                        
+                        # Reshape labels if they're scalars
+                        if len(labels.shape) == 1:
+                            labels = labels.float().unsqueeze(1)  # Convert to shape [B, 1]
                         
                         # Compute classification loss - labels should be float for BCEWithLogitsLoss
                         loss = classification_criterion(outputs, labels.float())
@@ -368,7 +389,7 @@ def main(args):
                 optimizer.zero_grad()
                 loss.backward()
                 backprop_time = time.time() - backprop_start_time
-                print('backprop time:', backprop_time)
+                debug_print('backprop time:', backprop_time)
                 
                 # Add gradient clipping to prevent exploding gradients and NaN values
                 #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -376,16 +397,32 @@ def main(args):
                 start_optim_time = time.time()
                 optimizer.step()
                 optim_time = time.time() - start_optim_time
-                print('optim time:', optim_time)
+                debug_print('optim time:', optim_time)
                 
                 train_loss += loss.item()
+
+                running['loss'] += loss.item()
+                preds = torch.argmax(probs, dim=1).cpu()
+                labs  = labels.view(-1).long().cpu()
+                running['TP']   += int(((preds == 1) & (labs == 1)).sum())
+                running['TN']   += int(((preds == 0) & (labs == 0)).sum())
+                running['FP']   += int(((preds == 1) & (labs == 0)).sum())
+                running['FN']   += int(((preds == 0) & (labs == 1)).sum())
+                running['seen'] += labs.size(0)
+                running['probs'].extend(probs[:,1].cpu().tolist())
+                running['labs'].extend(labs.tolist())
+                global_step     += 1
+            
+                # call the helper
+                log_batch_metrics(batch_idx, global_step, running, log_every, as_percentage=True)
+
+   
                 train_iterator.set_postfix(loss=f"{loss.item():.4f}")
             
-            # Calculate training metrics
             train_loss /= len(train_loader)
-
             
-            if not args.use_contrastive:
+
+            if args.task_mode != 'CONTRASTIVE':
                 train_probs = torch.cat(train_probs_all, dim=0).numpy()
                 train_labels = torch.cat(train_labels_all, dim=0).numpy().squeeze()
                 train_auroc = roc_auc_score(train_labels, train_probs[:, 1])
@@ -433,22 +470,22 @@ def main(args):
                     P_length = length.unsqueeze(1)  # Shape [B, 1]
                     
                     # Forward pass
-                    if args.use_contrastive and args.task_mode == 'CONTRASTIVE':
-                        # Get discharge text chunks for contrastive learning
-                        discharge_chunks = batch['discharge_chunks']
+                    if args.task_mode == 'CONTRASTIVE':
+                        # Get precomputed discharge summary embeddings
+                        text_embeddings = batch['ds_embedding'].to(device)
                         
                         # Forward pass to get base KEDGN representations
-                        # The KEDGN model now returns (output, aggregated_hidden, fused_features)
+                        # Use fused_features for the TS representation
                         _, _, ts_intermediate_rep = model.forward(P, static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor)
                         
-                        # Encode text chunks using a text encoder
-                        text_embeddings = model.text_encoder(discharge_chunks, output_dim=hidden_dim*2)
+                        # Text embeddings are precomputed
+                        # text_embeddings = model.text_encoder(discharge_chunks, output_dim=hidden_dim*2)
                         
                         # Project both time series and text embeddings
                         ts_proj = model.ts_projection(ts_intermediate_rep)
                         text_proj = model.text_projection(text_embeddings)
                         
-                        # Calculate contrastive loss
+                        # Calculate contrastive loss for validation (optional, usually classification metrics are preferred)
                         loss = contrastive_loss(
                             ts_proj, 
                             text_proj, 
@@ -456,10 +493,11 @@ def main(args):
                             temperature=args.temperature
                         )
                         
-                        # For validation in contrastive learning, we also compute classification metrics
-                        # by using the ts_intermediate_rep with a linear classifier
-                        linear_classifier = torch.nn.Linear(hidden_dim*2, n_class).to(device)
-                        outputs = linear_classifier(ts_intermediate_rep)
+                        # For validation in contrastive mode, evaluate classification performance using the learned TS representation
+                        # This requires a temporary linear classifier head
+                        if not hasattr(model, 'contrastive_val_classifier'):
+                             model.contrastive_val_classifier = torch.nn.Linear(ts_intermediate_rep.shape[-1], n_class).to(device)
+                        outputs = model.contrastive_val_classifier(ts_intermediate_rep)
                         probs = torch.softmax(outputs, dim=1)
                     else:
                         # Standard classification forward pass - unpack tuple returned by model
@@ -470,6 +508,10 @@ def main(args):
                             # If outputs are [B, 2], take only the positive class logits
                             if outputs.shape[1] == 2:
                                 outputs = outputs[:, 1].unsqueeze(1)  # Get positive class logits
+                                
+                            # Reshape labels if they're scalars
+                            if len(labels.shape) == 1:
+                                labels = labels.float().unsqueeze(1)  # Convert to shape [B, 1]
                                 
                             # Compute classification loss - labels should be float for BCEWithLogitsLoss
                             loss = classification_criterion(outputs, labels.float())
@@ -694,6 +736,13 @@ def main(args):
                     if outputs.shape[1] == 2:
                         outputs = outputs[:, 1].unsqueeze(1)  # Get positive class logits
                         
+                    # Reshape labels if they're scalars
+                    if len(labels.shape) == 1:
+                        labels = labels.float().unsqueeze(1)  # Convert to shape [B, 1]
+                    
+                    # Compute classification loss - labels should be float for BCEWithLogitsLoss
+                    loss = classification_criterion(outputs, labels.float())
+                    # Calculate probabilities
                     probs = torch.sigmoid(outputs)
                     # For binary classification with BCEWithLogitsLoss, create 2-column tensor for metrics
                     probs = torch.cat([1-probs, probs], dim=1)
@@ -755,6 +804,8 @@ def main(args):
 
 
 
+
+
 if __name__== "__main__":
 
     dotenv.load_dotenv('dot_env.txt')
@@ -769,7 +820,7 @@ if __name__== "__main__":
 
     parser.add_argument('--cuda', type=str, default='0')
     parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_dim', type=int, default=128)
     parser.add_argument('--rarity_alpha', type=float, default=1)
@@ -788,7 +839,7 @@ if __name__== "__main__":
     # Arguments for our dataloader wrapper
     parser.add_argument('--data_path', type=str, default='/Users/riccardoconci/Local_documents/!!MIMIC',
                         help='Path to MIMIC-IV data')
-    parser.add_argument('--temp_dfs_path', type=str, default='temp_dfs',
+    parser.add_argument('--temp_dfs_path', type=str, default='temp_dfs_lite',
                         help='Path to directory with existing processed files')
     parser.add_argument('--num_workers', type=int, default=8, help='Number of DataLoader workers')
     parser.add_argument('--outcome_choice', type=str, default='30d_mortality_discharge',

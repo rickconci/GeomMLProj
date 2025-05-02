@@ -10,6 +10,9 @@ import time
 import pickle
 import threading
 from data_scripts.data_lite import MIMICContrastivePairsDatasetLite
+from torch.utils.data import WeightedRandomSampler
+
+
 
 DEBUG_PRINT = False
 
@@ -19,81 +22,53 @@ def debug_print(*args, **kwargs):
         print(*args, **kwargs)
 
 
-# Custom collate function to handle variable-sized discharge chunks
-def custom_collate_fn(batch):
+def make_sampler(labels, p_target=0.2):
     """
-    Custom collate function that:
-      - Filters out None values that may be returned from the dataset's __getitem__ method
-      - If 'discharge_chunks' is present, we keep it as a list-of-lists and collate everything else with standard logic.
-      - If 'ds_embedding' is present, we keep it as a list of variable-sized tensors
-      - If 'discharge_chunks' is NOT present (e.g., in NEXT_24h mode), we just do a default_collate.
-      - Ensures all tensors are detached, contiguous, and have compatible shapes before batching.
+    labels: list of 0/1 ints for every sample in your dataset
+    p_target: desired fraction of positives in each batch
     """
-    # Filter out None values before collation
-    batch = [item for item in batch if item is not None]
+    num_pos = sum(labels)
+    num_neg = len(labels) - num_pos
+    if num_pos == 0 or num_neg == 0:
+        return None  # fallback to shuffle
+
+    # solve for w_pos/w_neg so that
+    #   P_draw(pos) = (num_pos*w_pos) / (num_pos*w_pos + num_neg*w_neg) = p_target
+    # assume w_neg = 1.0
+    w_pos = (p_target / (1 - p_target)) * (num_neg / num_pos)
+    w_neg = 1.0
+
+    weights = [w_pos if l == 1 else w_neg for l in labels]
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
     
-    # Early exit optimization: if the batch is empty, return an empty tensor
+def custom_collate_fn(batch):
+    # 1) drop any Nones (if your dataset ever returns None)
+    batch = [b for b in batch if b is not None]
     if not batch:
         return {}
+
+    # 2) pull out ds_embedding (list of [num_chunks × hidden_dim] tensors)
+    ds_embeddings = [b.pop('ds_embedding') for b in batch]
     
-    # Extract discharge_chunks and ds_embedding from all samples in advance
-    discharge_chunks = None
-    ds_embeddings = None
-    
-    # Check if we need to handle discharge_chunks specially
-    if 'discharge_chunks' in batch[0]:
-        # Store and remove discharge_chunks from each sample
-        discharge_chunks = [sample.pop('discharge_chunks', None) for sample in batch]
-    
-    # Check if we need to handle ds_embedding specially
-    if 'ds_embedding' in batch[0]:
-        # Store and remove ds_embedding from each sample
-        ds_embeddings = [sample.pop('ds_embedding', None) for sample in batch]
-    
-    # Make a copy of the batch with safe-to-batch tensors
-    safe_batch = []
-    
-    # Process each sample to ensure tensors are detached and contiguous
-    for sample in batch:
-        safe_sample = {}
-        for key, value in sample.items():
-            if torch.is_tensor(value):
-                # Ensure tensor is detached and contiguous
-                safe_sample[key] = value
-            else:
-                safe_sample[key] = value
-        safe_batch.append(safe_sample)
-    
-    try:
-        # Try standard collation
-        collated = default_collate(safe_batch)
-    except RuntimeError as e:
-        # If standard collation fails, use a more careful approach
-        print(f"Warning: Standard collation failed, trying one-by-one approach: {e}")
+    # 3) extract and handle next_phecodes list separately (variable length lists)
+    next_phecodes = None
+    if 'next_phecodes' in batch[0]:
+        next_phecodes = [b.pop('next_phecodes') for b in batch]
+
+    # 4) now everything left is either:
+    #    - a Python int (hadm_id, length, label, mortality_label, readmission_label)
+    #    - a fixed-size torch.Tensor (values, mask, static, times)
+    collated = default_collate(batch)
+
+    # 5) re-attach your lists of variable-length data
+    collated['ds_embedding'] = ds_embeddings
+    if next_phecodes is not None:
+        collated['next_phecodes'] = next_phecodes
         
-        # Initialize with first item's keys
-        collated = {}
-        keys_to_collate = list(safe_batch[0].keys())
-        
-        # Process each key separately
-        for key in keys_to_collate:
-            try:
-                values = [sample[key] for sample in safe_batch]
-                collated[key] = default_collate(values)
-            except Exception as key_error:
-                print(f"Could not collate field '{key}', keeping as list: {key_error}")
-                collated[key] = values  # Keep as list if collation fails
-    
-    # Re-insert discharge_chunks if we extracted them
-    if discharge_chunks is not None:
-        collated['discharge_chunks'] = discharge_chunks
-    
-    # Re-insert ds_embeddings if we extracted them
-    if ds_embeddings is not None:
-        collated['ds_embedding'] = ds_embeddings
-    
     return collated
 
+    
 
 def get_var_embeddings(data_path, temp_dfs_path):
     """
@@ -141,7 +116,6 @@ def get_dataloaders(data_path, temp_dfs_path='temp_dfs', batch_size=64,
     # Base kwargs
     loader_kwargs = dict(
         batch_size=batch_size,
-        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=custom_collate_fn,
@@ -153,8 +127,27 @@ def get_dataloaders(data_path, temp_dfs_path='temp_dfs', batch_size=64,
             prefetch_factor=2,
         )
 
-    train_loader = DataLoader(train_dataset, **loader_kwargs)
+    # ─── TRAIN LOADER ─────────────────────────────────────────────────────────
+    if task_mode == 'NEXT_24h':
 
+        labels = [label for (_,_,label) in train_dataset.samples]
+        sampler = make_sampler(labels, p_target=0.2)
+        
+        train_loader = DataLoader(
+            train_dataset,
+            sampler=sampler,
+            **loader_kwargs
+        )
+        
+    else:
+        # CONTRASTIVE or other: standard shuffle
+        train_loader = DataLoader(
+            train_dataset,
+            shuffle=True,
+            **loader_kwargs
+        )
+
+    # ─── VAL & TEST LOADERS ─────────────────────────────────────────────────────
     # validation and test typically shuffle=False
     val_kwargs = loader_kwargs.copy()
     val_kwargs['shuffle'] = False

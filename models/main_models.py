@@ -27,7 +27,7 @@ logging.basicConfig(
 
 
 class DSEncoderWithRNN(nn.Module):
-    def __init__(self, model_name="medicalai/ClinicalBERT", rnn_hidden_dim=768, projection_dim=1536):
+    def __init__(self, rnn_hidden_dim, projection_dim, model_name="medicalai/ClinicalBERT"):
         """
         model_name: Name of the pretrained ClinicalBERT model.
         rnn_hidden_dim: Hidden size for the GRU (can be equal to the transformer hidden size).
@@ -229,7 +229,7 @@ class KEDGN(nn.Module):
         self.d_static = d_static
         
         # For the 24h_mortality_discharge task, we need a single output for BCEWithLogitsLoss
-        output_dim = 1 if task_mode == '24h_mortality_discharge' else n_class
+        output_dim = 1 if task_mode == 'NEXT_24h' else n_class
         
         if d_static != 0:
             self.emb = nn.Linear(d_static, hidden_dim)

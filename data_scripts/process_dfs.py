@@ -140,11 +140,21 @@ class MIMICDischargeNotesProcessor:
 #############################################
 
 class DSDataset(Dataset):
-    def __init__(self, processor, merged_pickle_path='../temp_dfs/merged_with_disch_df_final_filtered.pkl'):
+    def __init__(self, processor, cache_dir='temp_dfs', merged_pickle_path=None):
         """
         The dataset returns (hadm_id, chunks) for each discharge note.
+        
+        Args:
+            processor: The MIMICDischargeNotesProcessor instance
+            cache_dir: Directory containing cached files (default: 'temp_dfs')
+            merged_pickle_path: Optional path to the merged_with_disch_df pickle file
         """
         self.processor = processor
+        
+        # Use provided merged_pickle_path or construct from cache_dir
+        if merged_pickle_path is None:
+            merged_pickle_path = os.path.join(cache_dir, "merged_with_disch_df_final_filtered.pkl")
+        
         merged_df = pickle.load(open(merged_pickle_path, 'rb'))
         discharge_df = pd.read_csv(processor.disch_path)[['hadm_id', 'charttime', 'text']]
         filtered = discharge_df['hadm_id'].isin(merged_df['hadm_id'])
@@ -159,8 +169,8 @@ class DSDataset(Dataset):
         chunks = self.processor.get_discharge_chunks(hadm_id)
         return hadm_id, chunks
 
-def get_ds_dataloader(processor, batch_size=8, num_workers=0):
-    dataset = DSDataset(processor)
+def get_ds_dataloader(processor, cache_dir='temp_dfs', batch_size=8, num_workers=0):
+    dataset = DSDataset(processor, cache_dir=cache_dir)
     # Each batch is a list of tuples (hadm_id, chunks)
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, collate_fn=lambda x: x)
 
@@ -226,7 +236,7 @@ class DSEmbeddingExtractor(nn.Module):
 #############################################
 
 if __name__ == '__main__':
-    output_dir = "../temp_dfs/DS_embeddings"
+    output_dir = "../temp_dfs_lite/DS_embeddings"
     os.makedirs(output_dir, exist_ok=True)
     
     print("Initializing processor...")

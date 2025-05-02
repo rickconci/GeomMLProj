@@ -106,14 +106,11 @@ def process_hadm(hadm_group, name_list, T, cache_dir):
     (values_tensor, mask_tensor, abs_time_tensor,
      rel_time_tensor, length) = pivot_and_pad_physio_optimized(physio_sub_df, name_list, T)
     
-    file_path = os.path.join(cache_dir, f"tensor_cache_{hadm}.pt")
-    torch.save({
-        'values_tensor': values_tensor,
-        'mask_tensor': mask_tensor,
-        'abs_time_tensor': abs_time_tensor,
-        'rel_time_tensor': rel_time_tensor,
-        'length': length,
-    }, file_path)
+    file_path = os.path.join(cache_dir, f"tensor_cache_{int(hadm)}.pt")
+    torch.save(
+        (values_tensor, mask_tensor, abs_time_tensor, rel_time_tensor, length), 
+        file_path
+    )
     
     # Return the hadm id and its corresponding length.
     return (hadm, length)
@@ -126,7 +123,7 @@ if __name__ == '__main__':
     ROOT_DIR = Path(__file__).resolve().parent
     temp_dfs_dir = ROOT_DIR / "temp_dfs"
     input_pkl = temp_dfs_dir / "sorted_filtered_df.pkl"
-    cache_dir = temp_dfs_dir / "processed_tensors"
+    cache_dir = temp_dfs_dir / "precomputed_tensors"
     
     top_how_many = 80
     max_T_events = 80
