@@ -18,6 +18,9 @@ import lmdb
 import time
 import joblib  # Add joblib for memory mapping
 import shutil
+from utils import get_device
+
+
 
 # Add a global debug flag to control verbosity
 DEBUG_PRINT = True
@@ -34,14 +37,16 @@ class MIMICContrastivePairsDatasetLite(Dataset):
                  task_mode='CONTRASTIVE',
                  chunk_hours=12,
                  label_window=24,
-                 T = 80):
+                 T = 80, 
+                 test_ds_only = False):
         self.split = split
         self.cache_dir = cache_dir
         self.task_mode = task_mode
         self.chunk_hours = chunk_hours
         self.label_window = label_window
         self.T = T
-
+        self.test_ds_only = test_ds_only
+        self.device = get_device()
         # ------------- New: Load baseline DataFrame -------------
         baseline_path = os.path.join(cache_dir, "processed_baseline_df.pkl")
         try:
@@ -53,21 +58,19 @@ class MIMICContrastivePairsDatasetLite(Dataset):
 
         # ------------- New: Set DS embeddings directory -------------
         self.ds_embeddings_dir = os.path.join(cache_dir, "DS_embeddings")
+        self.num_ds_embeddings = len(os.listdir(self.ds_embeddings_dir))
         
         # Check if directory exists
         if not os.path.exists(self.ds_embeddings_dir):
             print(f"DS embeddings directory not found. Creating {self.ds_embeddings_dir}")
             os.makedirs(self.ds_embeddings_dir, exist_ok=True)
-            
-        # Check if embeddings exist for at least some hadm_ids
-        sample_files = [f for f in os.listdir(self.ds_embeddings_dir) 
-                      if f.startswith("embedding_") and f.endswith(".pt")]
-        
-        if len(sample_files) == 0:
             self.process_dfs()
 
         # 1) Load hadm_ids for this split.
         self.merged_with_disch_df = pickle.load(open(os.path.join(cache_dir, "merged_with_disch_df_final_filtered.pkl"), "rb"))
+        print('loaded merged_with_disch_df')
+
+        
         self.hadm_ids = self.get_split_hadm_ids(split)
     
         # --- Index merged_with_disch_df by hadm_id for faster lookups --- 
@@ -75,6 +78,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             print("Indexing merged_with_disch_df by hadm_id...")
             self.merged_with_disch_df.set_index('hadm_id', inplace=True)
             print("Indexing complete.")
+            print(f"Debug: Checking if hadm_id exists in index: {21086876 in self.merged_with_disch_df.index}")
         # --- End indexing ---
 
         # 3) Build self.samples.
@@ -97,7 +101,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             
             # Initialize processor
             print("Initializing discharge notes processor...")
-            processor = MIMICDischargeNotesProcessor()
+            processor = MIMICDischargeNotesProcessor(cache_dir=self.cache_dir)
             
             # Initialize dataloader with the correct cache_dir
             print(f"Creating discharge notes dataloader with cache_dir: {self.cache_dir}")
@@ -105,9 +109,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             
             # Initialize embedding extractor
             print("Initializing embedding extractor...")
-            device = torch.device("cuda" if torch.cuda.is_available() else 
-                                "mps" if torch.backends.mps.is_available() else "cpu")
-            extractor = DSEmbeddingExtractor().to(device)
+            extractor = DSEmbeddingExtractor().to(self.device)
             extractor.eval()
             
             # Process and save embeddings
@@ -218,94 +220,122 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             print("Indexing complete.")
         return
 
-    def get_post_discharge_label(self, hadm_id):
+    def _next_unique_admission(self, pa: pd.DataFrame, hadm_id: int) -> int | None:
+        """
+        Return the next distinct hadm_id after the given one, or None if none exists.
+        Expects pa to have columns ['hadm_id','admittime'].
+        """
+        unique_ads = (
+            pa[['hadm_id','admittime']]
+              .drop_duplicates(subset='hadm_id')
+              .sort_values('admittime')
+        )
+        hadm_list = unique_ads['hadm_id'].tolist()
+        try:
+            idx = hadm_list.index(hadm_id)
+            if idx + 1 < len(hadm_list):
+                return hadm_list[idx + 1]
+        except ValueError:
+            pass
+        return None
+
+    def get_post_discharge_label(self, hadm_id: int) -> dict:
         """
         Compute post-discharge outcomes for a specific hospital admission:
-        1. Mortality within 6 months of discharge
-        2. Readmission within 15 days of discharge
-        3. PHE codes in the next admission
-
-        Args:
-            hadm_id: Hospital admission ID
+          1. mortality_6m
+          2. readmission_15d
+          3. current_phecodes
+          4. next_phecodes
 
         Returns:
-            dict: Dictionary with labels for the three tasks
+            dict
         """
         labels = {
             'mortality_6m': 0,
             'readmission_15d': 0,
+            'current_phecodes': [],
             'next_phecodes': []
         }
-
+        #print(f"hadm_id: {hadm_id}")
+        #print(self.merged_with_disch_df.loc[hadm_id])
         try:
-            # Find the patient data
-            patient_data = self.merged_with_disch_df.loc[hadm_id]
+            df = self.merged_with_disch_df
+            # Store original index state
+            original_index_name = df.index.name
             
-            # Get the discharge time
-            dischtime = pd.to_datetime(patient_data.get('dischtime'))
+            # First check if hadm_id exists
+            if original_index_name == 'hadm_id':
+                if hadm_id not in df.index:
+                    raise KeyError
+                raw = df.loc[hadm_id]
+            else:
+                if 'hadm_id' not in df.columns or hadm_id not in df['hadm_id'].values:
+                    raise KeyError
+                raw = df[df['hadm_id'] == hadm_id]
+
+            patient_data = raw.iloc[0] if isinstance(raw, pd.DataFrame) else raw
+            dischtime    = pd.to_datetime(patient_data.get('dischtime'))
             if pd.isna(dischtime):
                 return labels
 
-            # ---- 1. Mortality within 6 months of discharge ----
+            # 1) mortality within 6 months
             dod = pd.to_datetime(patient_data.get('dod'))
-            if pd.notna(dod):
-                time_to_death = dod - dischtime
-                if pd.Timedelta(days=0) < time_to_death <= pd.Timedelta(days=180):
-                    labels['mortality_6m'] = 1
+            if pd.notna(dod) and pd.Timedelta(0) < (dod - dischtime) <= pd.Timedelta(days=180):
+                labels['mortality_6m'] = 1
 
-            # ---- 2. Readmission within 15 days of discharge ----
+            # -- ensure phecode_df loaded --
+            if not hasattr(self, 'phecode_df') or self.phecode_df is None:
+                self.get_phecode_df()
+            pc_df = self.phecode_df
+
+            # 2) current admission phecodes
+            if pc_df is not None:
+                if pc_df.index.name == 'hadm_id':
+                    if hadm_id in pc_df.index:
+                        codes = pc_df.loc[hadm_id, 'PheCode']
+                    else:
+                        codes = []
+                else:
+                    subset = pc_df[pc_df['hadm_id'] == hadm_id]
+                    codes  = subset['PheCode'] if not subset.empty else []
+                labels['current_phecodes'] = pd.Series(codes).unique().tolist()
+
+            # 3) readmission & next admission phecodes
             subject_id = patient_data.get('subject_id')
             if subject_id is not None:
-                # Reset index if needed
-                df = self.merged_with_disch_df
-                if df.index.name == 'hadm_id':
-                    df = df.reset_index()
-                
-                # Get all admissions for this patient
-                patient_admissions = df[df['subject_id'] == subject_id].copy()
-                patient_admissions['admittime'] = pd.to_datetime(patient_admissions['admittime'])
-                patient_admissions = patient_admissions.sort_values('admittime')
-                
-                # Find the index of the current admission
-                current_idx = patient_admissions[patient_admissions['hadm_id'] == hadm_id].index
-                if len(current_idx) > 0:
-                    current_idx = current_idx[0]
-                    next_rows = patient_admissions.loc[patient_admissions.index > current_idx]
-                    
-                    # Check if there's a next admission
-                    if len(next_rows) > 0:
-                        next_admission = next_rows.iloc[0]
-                        next_admittime = pd.to_datetime(next_admission['admittime'])
-                        
-                        # Check if readmission was within 15 days
-                        if pd.Timedelta(days=0) < (next_admittime - dischtime) <= pd.Timedelta(days=15):
-                            labels['readmission_15d'] = 1
-                            
-                        # ---- 3. PHE codes in the next admission ----
-                        next_hadm_id = next_admission['hadm_id']
-                        if hasattr(self, 'phecode_df') and self.phecode_df is not None:
-                            # Get PHE codes from the next admission
-                            if self.phecode_df.index.name == 'hadm_id':
-                                next_phecodes = self.phecode_df.loc[self.phecode_df.index == next_hadm_id, 'PheCode'].unique().tolist()
+                # Create a working copy for admissions lookup
+                admissions = df.copy()
+                if admissions.index.name == 'hadm_id':
+                    admissions = admissions.reset_index()
+
+                pa = admissions[admissions['subject_id'] == subject_id].copy()
+                pa['admittime'] = pd.to_datetime(pa['admittime'])
+                pa = pa.sort_values('admittime').reset_index(drop=True)
+
+                next_hadm = self._next_unique_admission(pa, hadm_id)
+                if next_hadm is not None:
+                    next_row   = pa[pa['hadm_id'] == next_hadm].iloc[0]
+                    next_admit = pd.to_datetime(next_row['admittime'])
+                    if pd.Timedelta(0) < (next_admit - dischtime) <= pd.Timedelta(days=15):
+                        labels['readmission_15d'] = 1
+
+                    # next admission phecodes
+                    if pc_df is not None:
+                        if pc_df.index.name == 'hadm_id':
+                            if next_hadm in pc_df.index:
+                                codes = pc_df.loc[next_hadm, 'PheCode']
                             else:
-                                next_phecodes = self.phecode_df[self.phecode_df['hadm_id'] == next_hadm_id]['PheCode'].unique().tolist()
-                            labels['next_phecodes'] = next_phecodes
+                                codes = []
                         else:
-                            # Try to load phecode_df if not already loaded
-                            self.get_phecode_df()
-                            # Retry getting PHE codes
-                            if hasattr(self, 'phecode_df') and self.phecode_df is not None:
-                                if self.phecode_df.index.name == 'hadm_id':
-                                    next_phecodes = self.phecode_df.loc[self.phecode_df.index == next_hadm_id, 'PheCode'].unique().tolist()
-                                else:
-                                    next_phecodes = self.phecode_df[self.phecode_df['hadm_id'] == next_hadm_id]['PheCode'].unique().tolist()
-                                labels['next_phecodes'] = next_phecodes
-        
+                            subset = pc_df[pc_df['hadm_id'] == next_hadm]
+                            codes  = subset['PheCode'] if not subset.empty else []
+                        labels['next_phecodes'] = pd.Series(codes).unique().tolist()
+
         except KeyError:
-            debug_print(f"Warning: Could not find hadm_id {hadm_id} for label calculation.")
+            debug_print(f"Warning: hadm_id {hadm_id} not found.")
         except Exception as e:
-            debug_print(f"Warning: Error calculating labels for hadm_id {hadm_id}: {e}")
-            
+            debug_print(f"Warning: error in get_post_discharge_label for {hadm_id}: {e}")
+
         return labels
 
     def compute_samples(self, cache_file=None):
@@ -407,13 +437,46 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             print(f"Failed to save cache: {e}")
 
     def __len__(self):
-        return len(self.samples)
+        if self.test_ds_only:
+            return self.num_ds_embeddings
+        else:
+            return len(self.samples)
 
     def __getitem__(self, idx):
-        # Common loader for the "full" cache
-        joint_cache_dir = os.path.join(self.cache_dir, "precomputed_tensors")
-        os.makedirs(joint_cache_dir, exist_ok=True)
-        full_cache_fn   = lambda hid: f"tensor_cache_{hid}.pt"
+        if self.test_ds_only:
+            #print(f"Getting item {idx} for test_ds_only")
+            ds_embeddings_list = os.listdir(self.ds_embeddings_dir)
+            hadm_id = ds_embeddings_list[idx].split('_')[1].split('.')[0]
+            #print(f"hadm_id: {hadm_id}")
+
+            embedding_path = os.path.join(self.ds_embeddings_dir, f"embedding_{hadm_id}.pt")
+            embedding = torch.load(embedding_path)
+            #print(f"embedding: {embedding.shape}")
+
+            post_discharge_labels = self.get_post_discharge_label(int(hadm_id))
+            mortality_label = post_discharge_labels['mortality_6m']
+            readmission_label = post_discharge_labels['readmission_15d']
+            next_phecodes = post_discharge_labels['next_phecodes']
+            print(f"hadm_id: {hadm_id}, mortality_label: {mortality_label}, readmission_label: {readmission_label}, next_phecodes: {next_phecodes}")
+            
+            output = {
+                'hadm_id': hadm_id,
+                'values': torch.tensor([]), 
+                'mask': torch.tensor([]),
+                'static': torch.tensor([]),
+                'times': torch.tensor([]),
+                'length': 0,
+                'mortality_label': int(mortality_label),
+                'readmission_label': int(readmission_label),
+                'next_phecodes': next_phecodes,
+                'ds_embedding': embedding,
+            }
+            return output
+        else:
+            # Common loader for the "full" cache
+            joint_cache_dir = os.path.join(self.cache_dir, "precomputed_tensors")
+            os.makedirs(joint_cache_dir, exist_ok=True)
+            full_cache_fn   = lambda hid: f"tensor_cache_{hid}.pt"
     
         if self.task_mode == 'CONTRASTIVE':
             hadm_id = self.samples[idx]

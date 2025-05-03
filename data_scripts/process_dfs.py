@@ -7,24 +7,34 @@ from nltk.tokenize import word_tokenize
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
 
+# Get the current working directory where the script is being run from
+WORKING_DIR = os.getcwd()
+
 # Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 #############################################
 # 1. Discharge Notes Processor
 #############################################
 
 class MIMICDischargeNotesProcessor:
-    def __init__(self, disch_path='/Users/riccardoconci/Local_documents/!!MIMIC/note/discharge.csv'):
-        self.disch_path = disch_path
-        # Load only the necessary columns and index by hadm_id for speed.
-        self.discharge_df = pd.read_csv(self.disch_path)[['hadm_id', 'charttime', 'text']]
+    def __init__(self, cache_dir='temp_dfs_lite'):
+        # Make cache_dir relative to working directory
+        self.cache_dir = os.path.join(WORKING_DIR, cache_dir)
+
+        discharge_pickle_path = os.path.join(self.cache_dir, 'discharge_df_filtered.pkl')
+        if os.path.exists(discharge_pickle_path):
+            self.discharge_df = pickle.load(open(discharge_pickle_path, 'rb'))
+            print(f"Loaded discharge_df from {discharge_pickle_path}")
+        else:
+            raise FileNotFoundError(f"provide discharge_df_filtered.pkl file or CSV file")
+          
         self.discharge_df = self.discharge_df.set_index('hadm_id')
         self.memory_cache = {}
-        
+            
         self.sections_to_include = [
             "History of Present Illness",
             "Past Medical History",
@@ -122,7 +132,7 @@ class MIMICDischargeNotesProcessor:
                 })
         return selected_blocks
     
-    def chunkify_blocks_nltk(self, blocks, words_per_chunk=150):
+    def chunkify_blocks_nltk(self, blocks, words_per_chunk=100):
         """Tokenize each block using NLTK and reassemble them into uniform chunks."""
         all_words = []
         for block in blocks:
@@ -140,7 +150,7 @@ class MIMICDischargeNotesProcessor:
 #############################################
 
 class DSDataset(Dataset):
-    def __init__(self, processor, cache_dir='temp_dfs', merged_pickle_path=None):
+    def __init__(self, processor):
         """
         The dataset returns (hadm_id, chunks) for each discharge note.
         
@@ -150,16 +160,18 @@ class DSDataset(Dataset):
             merged_pickle_path: Optional path to the merged_with_disch_df pickle file
         """
         self.processor = processor
+        self.cache_dir = processor.cache_dir
         
         # Use provided merged_pickle_path or construct from cache_dir
-        if merged_pickle_path is None:
-            merged_pickle_path = os.path.join(cache_dir, "merged_with_disch_df_final_filtered.pkl")
-        
+        merged_pickle_path = os.path.join(self.cache_dir, "merged_with_disch_df_final_filtered.pkl")
         merged_df = pickle.load(open(merged_pickle_path, 'rb'))
-        discharge_df = pd.read_csv(processor.disch_path)[['hadm_id', 'charttime', 'text']]
-        filtered = discharge_df['hadm_id'].isin(merged_df['hadm_id'])
-        self.discharge_df = discharge_df.loc[filtered].set_index('hadm_id')
-        self.hadm_ids = list(self.discharge_df.index.unique())
+        discharge_df = processor.discharge_df
+
+        if 'hadm_id' in discharge_df.columns:
+            filtered = discharge_df['hadm_id'].isin(merged_df['hadm_id'])
+            self.discharge_df = discharge_df.loc[filtered].set_index('hadm_id')
+
+        self.hadm_ids = list(discharge_df.index.unique())
     
     def __len__(self):
         return len(self.hadm_ids)
@@ -169,98 +181,116 @@ class DSDataset(Dataset):
         chunks = self.processor.get_discharge_chunks(hadm_id)
         return hadm_id, chunks
 
-def get_ds_dataloader(processor, cache_dir='temp_dfs', batch_size=8, num_workers=0):
-    dataset = DSDataset(processor, cache_dir=cache_dir)
-    # Each batch is a list of tuples (hadm_id, chunks)
-    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, collate_fn=lambda x: x)
-
 #############################################
 # 3. Embedding Extractor (Transformer Only)
 #############################################
-
 class DSEmbeddingExtractor(nn.Module):
     def __init__(self, model_name="medicalai/ClinicalBERT"):
         super().__init__()
+        self.device = DEVICE
+        # Use the base AutoModel (no MLM head) for embeddings
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.transformer = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
-        self.hidden_dim = self.transformer.config.hidden_size  # e.g., 768
-    
+        self.transformer = AutoModel.from_pretrained(model_name).to(DEVICE)
+        self.transformer.eval()  # always inference mode
+        
+        self.hidden_dim = self.transformer.config.hidden_size
+        self.max_length = 512
+        self.tokenizer.model_max_length = self.max_length
+        
+        print(f"Using model '{model_name}' with max sequence length {self.max_length} on {DEVICE}")
+
     def forward(self, chunks_batch):
         """
         Args:
-            chunks_batch: A list (batch_size) of lists of text chunks.
-            
+            chunks_batch: List of tuples (hadm_id, chunks), 
+                          where chunks is a list of strings.
         Returns:
-            batch_embeddings: A list (batch_size) where each element is a tensor of shape [num_chunks, hidden_dim].
+            final_embeddings: List (batch_size) of Tensors [num_chunks, hidden_dim].
         """
         batch_size = len(chunks_batch)
-        all_chunks = []
-        sample_indices = []
+
+        # Flatten all non-empty chunks, track which sample they came from
+        flattened, sample_map = [], []
+        for i, (_, chunks) in enumerate(chunks_batch):
+            for c in chunks or []:
+                if c and c.strip():
+                    flattened.append(c)
+                    sample_map.append(i)
         
-        # Flatten all chunks (and remember which sample each belongs to)
-        for i, chunks in enumerate(chunks_batch):
-            for chunk in chunks:
-                all_chunks.append(chunk)
-                sample_indices.append(i)
-        
-        # If there are no chunks in any sample, return empty tensors for each
-        if len(all_chunks) == 0:
-            return [torch.empty(0, self.hidden_dim, device=device) for _ in range(batch_size)]
-        
-        inputs = self.tokenizer(all_chunks, padding=True, truncation=True, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
+        # Early exit if nothing to encode
+        if not flattened:
+            empty = torch.zeros(0, self.hidden_dim, device=self.device)
+            return [empty.clone() for _ in range(batch_size)]
+
+        # Tokenize once, with statistics
+        enc = self.tokenizer(
+            flattened,
+            truncation=True,
+            padding="longest",
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        input_lengths = enc["input_ids"].ne(self.tokenizer.pad_token_id).sum(-1)
+        print(
+            f"Chunk lengths — min: {input_lengths.min().item()}, "
+            f"max: {input_lengths.max().item()}, "
+            f"avg: {input_lengths.float().mean().item():.1f}"
+        )
+
+        enc = {k: v.to(self.device) for k, v in enc.items()}
+
         with torch.no_grad():
-            self.transformer.eval()
-            outputs = self.transformer(**inputs, output_hidden_states=True)
-            # Use the CLS token embedding from the last hidden state
-            last_hidden_states = outputs.hidden_states[-1]
-            cls_embeddings = last_hidden_states[:, 0, :]  # [num_chunks, hidden_dim]
-        
-        # Reassemble embeddings per sample.
-        batch_embeddings = [[] for _ in range(batch_size)]
-        for idx, emb in zip(sample_indices, cls_embeddings):
-            batch_embeddings[idx].append(emb)
-        
-        # For each sample, stack embeddings (if any) into a tensor.
-        final_embeddings = []
-        for emb_list in batch_embeddings:
-            if emb_list:
-                final_embeddings.append(torch.stack(emb_list, dim=0))
+            out = self.transformer(**enc, output_hidden_states=False)
+            # out.last_hidden_state: [total_chunks, seq_len, hidden_dim]
+            cls_embeds = out.last_hidden_state[:, 0, :]
+
+        # Group back into per-sample lists
+        grouped = [[] for _ in range(batch_size)]
+        for idx, emb in zip(sample_map, cls_embeds):
+            grouped[idx].append(emb)
+
+        # Stack and handle samples that had no valid chunks
+        result = []
+        for i, lst in enumerate(grouped):
+            if lst:
+                result.append(torch.stack(lst, dim=0))
             else:
-                final_embeddings.append(torch.empty(0, self.hidden_dim, device=device))
-        return final_embeddings
+                # if no text, return a single zero-vector
+                print(f"Warning: no valid chunks for sample {chunks_batch[i][0]}")
+                result.append(torch.zeros(1, self.hidden_dim, device=self.device))
+
+        return result
+    
+
 
 #############################################
 # 4. Batch Processing and Saving Embeddings
 #############################################
 
 if __name__ == '__main__':
-    output_dir = "../temp_dfs_lite/DS_embeddings"
+    # Make output_dir relative to working directory
+    output_dir = os.path.join(WORKING_DIR, "temp_dfs_lite/DS_embeddings")
     os.makedirs(output_dir, exist_ok=True)
     
     print("Initializing processor...")
-    processor = MIMICDischargeNotesProcessor()
+    processor = MIMICDischargeNotesProcessor(cache_dir='temp_dfs_lite')
     print("Initializing dataloader...")
-    dataloader = get_ds_dataloader(processor, batch_size=8)
+    dataset = DSDataset(processor)
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=lambda x: x)
     
-    extractor = DSEmbeddingExtractor().to(device)
+    extractor = DSEmbeddingExtractor()
     extractor.eval()
-    
-    # Process each batch with tqdm for progress tracking.
+
     for batch in tqdm(dataloader, desc="Extracting embeddings"):
-        hadm_ids = []
-        chunks_batch = []
-        for hadm_id, chunks in batch:
-            hadm_ids.append(hadm_id)
-            chunks_batch.append(chunks)
-        
+        hadm_ids, chunks_lists = zip(*batch)
+        for h_id, ch in zip(hadm_ids, chunks_lists):
+            print(h_id, len(ch))
+
         with torch.no_grad():
-            # Get a list (length batch_size) of tensors [num_chunks, hidden_dim]
-            batch_embeddings = extractor(chunks_batch)
+            # Pass the tuples directly—this matches DSEmbeddingExtractor.forward’s signature
+            batch_embeddings = extractor(batch)
         
-        # Save each embedding tensor as "embedding_{hadm_id}.pt"
         for h_id, emb_tensor in zip(hadm_ids, batch_embeddings):
-            save_path = os.path.join(output_dir, f"embedding_{h_id}.pt")
-            torch.save(emb_tensor.cpu(), save_path)
-            # Optionally, print progress per saved file.
+             print('saving embedding for', h_id, 'with shape', emb_tensor.shape)
+             save_path = os.path.join(output_dir, f"embedding_{h_id}.pt")
+             torch.save(emb_tensor.cpu(), save_path)

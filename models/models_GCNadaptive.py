@@ -9,8 +9,10 @@ import math
 import os
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from models.models_utils import MLP, MLP_Param
-from utils import device
+from utils import get_device
 
+# Get the device
+device = get_device()
 
 # Configure logging for debugging - file only, no console output
 os.makedirs('logs', exist_ok=True)

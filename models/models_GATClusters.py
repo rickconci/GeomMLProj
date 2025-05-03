@@ -8,6 +8,7 @@ import logging
 import math
 import os
 from models.models_utils import MLP_Param, MLP
+from utils import get_device
 
 
 
@@ -703,3 +704,15 @@ class ClusterBasedVSDGATRNN(nn.Module):
             return output, cluster_output
         else:
             return output
+
+class GATClusters(nn.Module):
+    def __init__(self, DEVICE=None, hidden_dim=256, num_of_variables=100, num_of_timestamps=100, d_static=0, n_class=1, phe_code_size=1000, task_mode='CONTRASTIVE'):
+        super(GATClusters, self).__init__()
+        self.DEVICE = DEVICE if DEVICE is not None else get_device()
+        self.hidden_dim = hidden_dim
+        self.num_of_variables = num_of_variables
+        self.num_of_timestamps = num_of_timestamps
+        self.d_static = d_static
+        self.n_class = n_class
+        self.phe_code_size = phe_code_size
+        self.task_mode = task_mode

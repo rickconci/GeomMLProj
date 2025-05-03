@@ -82,7 +82,7 @@ def get_var_embeddings(data_path, temp_dfs_path):
 
 
 def get_dataloaders(data_path, temp_dfs_path='temp_dfs', batch_size=64, 
-                    num_workers=12, task_mode='CONTRASTIVE'):
+                    num_workers=12, task_mode='CONTRASTIVE', test_ds_only=False):
     """
     Create DataLoader objects for train, validation, and test sets
     
@@ -105,6 +105,7 @@ def get_dataloaders(data_path, temp_dfs_path='temp_dfs', batch_size=64,
         task_mode=task_mode,
         chunk_hours=12,
         label_window=24,
+        test_ds_only=test_ds_only
     )
     print("Creating train dataset...")
     train_dataset = MIMICContrastivePairsDatasetLite(split='train',  **dataset_kwargs)

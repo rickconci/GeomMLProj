@@ -6,10 +6,13 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
-
+from torch.utils.data import Dataset, DataLoader
 from dataloader_lite import get_dataloaders
 from models.multi_task_model import MultiTaskKEDGN
 from models.ds_only_model import DSOnlyMultiTaskModel
+from utils import get_device
+import wandb
+import dotenv
 
 # Configure basic logging
 import logging
@@ -34,6 +37,7 @@ def train_one_epoch(model, data_loader, optimizer, device, model_type):
         if not batch:
             continue
             
+        
         # Get labels
         mortality_labels = batch['mortality_label'].float().to(device)
         readmission_labels = batch['readmission_label'].float().to(device)
@@ -261,38 +265,46 @@ def main():
     parser.add_argument('--data_path', type=str, default='/Users/riccardoconci/Local_documents/!!MIMIC', help='Path to MIMIC-IV data')
     parser.add_argument('--temp_dfs_path', type=str, default='temp_dfs_lite', help='Path to cache directory')
     parser.add_argument('--model_type', type=str, choices=['full', 'ds_only'], default='ds_only', help='Model type to train')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
     parser.add_argument('--projection_dim', type=int, default=512, help='Projection dimension for DS encoder')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
     parser.add_argument('--num_workers', type=int, default=2, help='Number of dataloader workers')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--pooling_type', type=str, default='attention', choices=['weighted_sum', 'attention'], help='Pooling type for DS encoder')
+    parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads for DS encoder')
+    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='GeomMLProj_Baseline', help='WandB project name')
+    parser.add_argument('--wandb_entity', type=str, default='None', help='WandB entity name')
     args = parser.parse_args()
     
     # Set seeds for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    # Determine device
-    if torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print("Using MPS device")
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-        print("Using CUDA device")
-    else:
-        device = torch.device('cpu')
-        print("Using CPU device")
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        dotenv.load_dotenv('dot_env.txt')
+        wandb.login(key=os.getenv("WANDB_API_KEY"))
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            config=vars(args)
+        )
+    
+    # Determine device and print once
+    device = get_device()
     
     # Load data
     print("Loading data...")
     train_loader, val_loader, test_loader, var_embeddings = get_dataloaders(
-        data_path=args.data_path,
-        temp_dfs_path=args.temp_dfs_path,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        task_mode='CONTRASTIVE'  # Always use CONTRASTIVE for multi-task
+    data_path=args.data_path,
+    temp_dfs_path=args.temp_dfs_path,
+    batch_size=args.batch_size,
+    num_workers=args.num_workers,
+    task_mode='CONTRASTIVE',
+    test_ds_only=True
     )
     
     # Ensure PHE code mappings are loaded by calling get_phecode_df
@@ -315,7 +327,9 @@ def main():
             DEVICE=device,
             hidden_dim=args.hidden_dim,
             projection_dim=args.projection_dim,
-            phe_code_size=phe_code_size
+            phe_code_size=phe_code_size,
+            pooling_type=args.pooling_type,
+            num_heads=args.num_heads
         )
     else:
         # For the full model, we need to extract dimensions from data
@@ -353,6 +367,16 @@ def main():
         print(f"  Readmission Loss: {train_metrics['readmission_loss']:.4f}")
         print(f"  PHE Code Loss: {train_metrics['phecode_loss']:.4f}")
         
+        # Log training metrics to wandb
+        if args.use_wandb:
+            wandb.log({
+                "train/loss": train_metrics['loss'],
+                "train/mortality_loss": train_metrics['mortality_loss'],
+                "train/readmission_loss": train_metrics['readmission_loss'],
+                "train/phecode_loss": train_metrics['phecode_loss'],
+                "epoch": epoch
+            })
+        
         # Validate
         val_metrics = evaluate(model, val_loader, device, args.model_type)
         print(f"Validation Metrics:")
@@ -361,15 +385,31 @@ def main():
         print(f"  Readmission AUROC: {val_metrics['readmission_auroc']:.4f}")
         print(f"  Readmission AUPRC: {val_metrics['readmission_auprc']:.4f}")
         
+        # Log validation metrics to wandb
+        if args.use_wandb:
+            wandb.log({
+                "val/mortality_auroc": val_metrics['mortality_auroc'],
+                "val/mortality_auprc": val_metrics['mortality_auprc'],
+                "val/readmission_auroc": val_metrics['readmission_auroc'],
+                "val/readmission_auprc": val_metrics['readmission_auprc'],
+                "epoch": epoch
+            })
+        
         # Print PHE code metrics if available
         if 'phecode_macro_auc' in val_metrics:
             print(f"  PHE Code Macro AUC: {val_metrics['phecode_macro_auc']:.4f}")
+            if args.use_wandb:
+                wandb.log({
+                    "val/phecode_macro_auc": val_metrics['phecode_macro_auc'],
+                    "epoch": epoch
+                })
         if 'phecode_micro_auc' in val_metrics:
             print(f"  PHE Code Micro AUC: {val_metrics['phecode_micro_auc']:.4f}")
-        if 'top_phecodes' in val_metrics:
-            print("  Top PHE Codes (code, frequency, AUC):")
-            for code, freq, auc in val_metrics['top_phecodes'][:5]:  # Show top 5
-                print(f"    {code}: freq={int(freq)}, AUC={auc:.4f}")
+            if args.use_wandb:
+                wandb.log({
+                    "val/phecode_micro_auc": val_metrics['phecode_micro_auc'],
+                    "epoch": epoch
+                })
         
         # Save best model (using average of all metrics as overall score)
         metrics_to_average = [
@@ -392,7 +432,7 @@ def main():
     
     # Test best model
     print("\nEvaluating best model on test set...")
-    model.load_state_dict(torch.load(f'model_{args.model_type}_best.pt')['model_state_dict'])
+    model.load_state_dict(torch.load(f'model_{args.model_type}_best.pt', weights_only=False)['model_state_dict'])
     test_metrics = evaluate(model, test_loader, device, args.model_type)
     print(f"Test Metrics:")
     print(f"  Mortality AUROC: {test_metrics['mortality_auroc']:.4f}")
@@ -400,15 +440,32 @@ def main():
     print(f"  Readmission AUROC: {test_metrics['readmission_auroc']:.4f}")
     print(f"  Readmission AUPRC: {test_metrics['readmission_auprc']:.4f}")
     
+    # Log test metrics to wandb
+    if args.use_wandb:
+        wandb.log({
+            "test/mortality_auroc": test_metrics['mortality_auroc'],
+            "test/mortality_auprc": test_metrics['mortality_auprc'],
+            "test/readmission_auroc": test_metrics['readmission_auroc'],
+            "test/readmission_auprc": test_metrics['readmission_auprc']
+        })
+    
     # Print PHE code metrics if available
     if 'phecode_macro_auc' in test_metrics:
         print(f"  PHE Code Macro AUC: {test_metrics['phecode_macro_auc']:.4f}")
+        if args.use_wandb:
+            wandb.log({
+                "test/phecode_macro_auc": test_metrics['phecode_macro_auc']
+            })
     if 'phecode_micro_auc' in test_metrics:
         print(f"  PHE Code Micro AUC: {test_metrics['phecode_micro_auc']:.4f}")
-    if 'top_phecodes' in test_metrics:
-        print("  Top PHE Codes (code, frequency, AUC):")
-        for code, freq, auc in test_metrics['top_phecodes'][:5]:  # Show top 5
-            print(f"    {code}: freq={int(freq)}, AUC={auc:.4f}")
+        if args.use_wandb:
+            wandb.log({
+                "test/phecode_micro_auc": test_metrics['phecode_micro_auc']
+            })
+    
+    # Finish wandb run
+    if args.use_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main() 

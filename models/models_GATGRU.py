@@ -9,6 +9,7 @@ import math
 import os
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from models.models_utils import MLP, MLP_Param
+from utils import get_device
 
 if torch.backends.mps.is_available():
     device = torch.device('mps')
@@ -335,3 +336,17 @@ class VSDGATRNN(nn.Module):
         
         # In case the loop exits normally (though above branch should have returned at final step).
         return output
+
+class GATGRU(nn.Module):
+    def __init__(self, DEVICE=None, hidden_dim=256, num_of_variables=100, num_of_timestamps=100, d_static=0, n_class=1, phe_code_size=1000, task_mode='CONTRASTIVE'):
+        super(GATGRU, self).__init__()
+        self.DEVICE = DEVICE if DEVICE is not None else get_device()
+        self.hidden_dim = hidden_dim
+        self.num_of_variables = num_of_variables
+        self.num_of_timestamps = num_of_timestamps
+        self.d_static = d_static
+        self.n_class = n_class
+        self.phe_code_size = phe_code_size
+        self.task_mode = task_mode
+
+        # ... rest of the existing code ...

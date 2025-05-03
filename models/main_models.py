@@ -12,8 +12,10 @@ from models.models_GCNadaptive import VSDGCRNN
 from models.models_GATGRU import VSDGATRNN
 from models.models_GATClusters import ClusterBasedVSDGATRNN
 from models.models_utils import Value_Encoder, Time_Encoder
-from utils import device
+from utils import get_device
 
+# Get the device
+device = get_device()
 
 # Configure logging for debugging - file only, no console output
 os.makedirs('logs', exist_ok=True)
@@ -24,107 +26,142 @@ logging.basicConfig(
         logging.FileHandler('logs/models.log')
     ]
 )
+import torch
+import torch.nn as nn
 
 
-class DSEncoderWithRNN(nn.Module):
-    def __init__(self, rnn_hidden_dim, projection_dim, model_name="medicalai/ClinicalBERT"):
+class DSEncoderWithWeightedSum(nn.Module):
+    def __init__(self, hidden_dim, projection_dim, pooling_type='weighted_sum', num_heads=4):
         """
-        model_name: Name of the pretrained ClinicalBERT model.
-        rnn_hidden_dim: Hidden size for the GRU (can be equal to the transformer hidden size).
-        projection_dim: Final dimension for contrastive learning, e.g. 2 * hidden_dim.
+        hidden_dim: Dimensionality of the pre-computed chunk embeddings.
+        projection_dim: Final dimension for downstream tasks.
+        pooling_type: Either 'weighted_sum' or 'attention'
+        num_heads: Number of attention heads (only used if pooling_type='attention')
         """
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.transformer = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
-        hidden_dim = self.transformer.config.hidden_size  # e.g., 768
         
-        # GRU to process sequence of chunk embeddings.
-        self.gru = nn.GRU(
-            input_size=hidden_dim, 
-            hidden_size=rnn_hidden_dim, 
-            batch_first=True
-        )
+        self.pooling_type = pooling_type
+        self.hidden_dim = hidden_dim
+        self.device = get_device()
         
-        # Projection layer: maps the GRU output to your desired embedding dimension.
+        # Project from embedding dimension (768) to hidden dimension
+        self.embedding_proj = nn.Linear(768, hidden_dim)
+        
+        if pooling_type == 'weighted_sum':
+            # The input dimension should match the embedding dimension (768 in this case)
+            self.weight_proj = nn.Linear(768, 1)  # Changed from hidden_dim to 768
+        elif pooling_type == 'attention':
+            # For multi-head attention
+            self.num_heads = num_heads
+            self.head_dim = hidden_dim // num_heads
+            assert self.head_dim * num_heads == hidden_dim, "hidden_dim must be divisible by num_heads"
+            
+            # Query, Key, Value projections
+            self.query_proj = nn.Linear(768, hidden_dim)  # Changed from hidden_dim to 768
+            self.key_proj = nn.Linear(768, hidden_dim)    # Changed from hidden_dim to 768
+            self.value_proj = nn.Linear(768, hidden_dim)  # Changed from hidden_dim to 768
+            
+            # Output projection
+            self.output_proj = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            raise ValueError(f"Unknown pooling_type: {pooling_type}")
+        
         self.projection = nn.Sequential(
-            nn.Linear(rnn_hidden_dim, projection_dim),
-            nn.ReLU()  # Optional activation, adjust as needed.
+            nn.Linear(hidden_dim, projection_dim),
+            nn.ReLU()
         )
-    
-    def forward(self, discharge_chunks, output_dim=None):
-        """
-        discharge_chunks: A list of samples.
-                          Each sample is a list of text chunks (strings).
-                          
-        output_dim: Optional output dimension override
         
-        The function returns a tensor of shape [B, projection_dim or output_dim].
-        """
-        batch_size = len(discharge_chunks)
-        all_chunks = []   # To store all chunk texts across the batch.
-        sample_indices = []  # To track which sample each chunk belongs to.
-        
-        # If all chunks are empty, return a tensor of zeros
-        if all(len(chunks) == 0 for chunks in discharge_chunks):
-            if output_dim is None:
-                output_dim = self.projection[0].out_features
-            return torch.zeros(batch_size, output_dim, device=device)
-        
-        # Flatten the list of lists.
-        for i, chunks in enumerate(discharge_chunks):
-            for chunk in chunks:
-                all_chunks.append(chunk)
-                sample_indices.append(i)
-        
-        # If no chunks after filtering, return zeros
-        if len(all_chunks) == 0:
-            if output_dim is None:
-                output_dim = self.projection[0].out_features
-            return torch.zeros(batch_size, output_dim, device=device)
-        
-        # Tokenize all chunks in one call.
-        inputs = self.tokenizer(all_chunks, padding=True, truncation=True, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        # Process with ClinicalBERT using the approach that works
-        with torch.no_grad():
-            self.transformer.eval()  # Ensure model is in eval mode
-            outputs = self.transformer(**inputs, output_hidden_states=True)
-            # Extract embeddings from the last hidden state's first token (CLS)
-            last_hidden_states = outputs.hidden_states[-1]  # shape: (num_chunks, seq_len, hidden_size)
-            cls_embeddings = last_hidden_states[:, 0, :]  # shape: (num_chunks, hidden_size)
-        
-        # Reassemble the embeddings into per-sample lists
-        batch_embeddings = [[] for _ in range(batch_size)]
-        for idx, emb in zip(sample_indices, cls_embeddings):
-            batch_embeddings[idx].append(emb)
-        
-        # Process each sample separately
-        projected_embeddings = []
-        for i, embeddings in enumerate(batch_embeddings):
-            if not embeddings:
-                # If this sample has no embeddings, use zeros
-                if output_dim is None:
-                    output_dim = self.projection[0].out_features
-                projected_embeddings.append(torch.zeros(output_dim, device=device))
-                continue
-                
-            # Stack this sample's embeddings
-            sample_emb = torch.stack(embeddings, dim=0)  # [num_chunks, hidden_dim]
-            
-            # Process with GRU to handle variable number of chunks
-            _, h_n = self.gru(sample_emb.unsqueeze(0))  # Add batch dimension
-            
-            # Get final hidden state
-            final_state = h_n[0]  # [1, hidden_dim]
-            
-            # Project to final dimension
-            proj = self.projection(final_state.squeeze(0))  # [projection_dim]
-            projected_embeddings.append(proj)
-        
-        # Stack all sample embeddings
-        return torch.stack(projected_embeddings, dim=0)  # [batch_size, projection_dim]
+        # Move all layers to device
+        self.to(self.device)
 
+    def _weighted_sum_pooling(self, embs):
+        """Weighted sum pooling implementation"""
+        # Ensure input is on correct device
+        embs = embs.to(self.device)
+        scores = self.weight_proj(embs).squeeze(-1)  # [T_i]
+        weights = torch.softmax(scores, dim=0)  # [T_i]
+        pooled = (weights.unsqueeze(-1) * embs).sum(dim=0)  # [hidden_dim]
+        # Project from embedding dimension to hidden dimension
+        pooled = self.embedding_proj(pooled)  # [hidden_dim]
+        return pooled
+
+    def _attention_pooling(self, embs):
+        """Multi-head attention pooling implementation"""
+        # Ensure input is on correct device
+        embs = embs.to(self.device)
+        batch_size = embs.size(0) if len(embs.shape) > 2 else 1
+        seq_len = embs.size(0) if len(embs.shape) > 2 else embs.size(0)
+        
+        # Project to Q, K, V
+        Q = self.query_proj(embs)  # [seq_len, hidden_dim]
+        K = self.key_proj(embs)    # [seq_len, hidden_dim]
+        V = self.value_proj(embs)  # [seq_len, hidden_dim]
+        
+        # Reshape for multi-head attention
+        Q = Q.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, seq_len, head_dim]
+        K = K.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, seq_len, head_dim]
+        V = V.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, seq_len, head_dim]
+        
+        # Compute attention scores
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [num_heads, seq_len, seq_len]
+        attention_weights = torch.softmax(attention_scores, dim=-1)  # [num_heads, seq_len, seq_len]
+        
+        # Apply attention to values
+        attended = torch.matmul(attention_weights, V)  # [num_heads, seq_len, head_dim]
+        
+        # Combine heads
+        attended = attended.transpose(0, 1).contiguous().view(seq_len, self.hidden_dim)  # [seq_len, hidden_dim]
+        
+        # Project output
+        output = self.output_proj(attended)  # [seq_len, hidden_dim]
+        
+        # Average pooling across sequence
+        pooled = output.mean(dim=0)  # [hidden_dim]
+        
+        return pooled
+
+    def forward(self, discharge_embeddings, output_dim=None):
+        """
+        discharge_embeddings: Either:
+            - A tensor of shape [B, T, hidden_dim] where B is batch size and T is number of chunks
+            - A list of B tensors, each of shape [T_i, hidden_dim] where T_i is number of chunks for that sample
+        Returns a tensor of shape [B, projection_dim or output_dim].
+        """
+        # Handle tensor input
+        if torch.is_tensor(discharge_embeddings):
+            batch_size = discharge_embeddings.size(0)
+            outputs = []
+            for i in range(batch_size):
+                embs = discharge_embeddings[i]  # [T, hidden_dim]
+                if self.pooling_type == 'weighted_sum':
+                    pooled = self._weighted_sum_pooling(embs)
+                else:
+                    pooled = self._attention_pooling(embs)
+                outputs.append(pooled)
+            pooled = torch.stack(outputs, dim=0)  # [B, hidden_dim]
+            
+        # Handle list of tensors input
+        else:
+            batch_size = len(discharge_embeddings)
+            outputs = []
+            
+            for embs in discharge_embeddings:
+                if embs.numel() == 0:  # Empty tensor
+                    dim = output_dim or self.projection[0].out_features
+                    outputs.append(torch.zeros(dim, device=self.device))
+                    continue
+                    
+                if self.pooling_type == 'weighted_sum':
+                    pooled = self._weighted_sum_pooling(embs)
+                else:
+                    pooled = self._attention_pooling(embs)
+                outputs.append(pooled)
+            
+            pooled = torch.stack(outputs, dim=0)  # [batch_size, hidden_dim]
+        
+        # Project to final dimension
+        proj = self.projection(pooled)  # [batch_size, projection_dim]
+        return proj
 
 
 

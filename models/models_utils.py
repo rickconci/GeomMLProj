@@ -7,6 +7,17 @@ import logging
 import math
 import os
 from transformers import AutoTokenizer, AutoModelForMaskedLM
+from utils import get_device
+
+
+def get_device_info():
+    device = get_device()
+    if device.type == 'mps':
+        return "MPS"
+    elif device.type == 'cuda':
+        return "CUDA"
+    else:
+        return "CPU"
 
 
 if torch.backends.mps.is_available():

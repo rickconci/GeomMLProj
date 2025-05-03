@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
-from models.main_models import DSEncoderWithRNN
+from models.main_models import DSEncoderWithWeightedSum
+from utils import get_device
+
+DEVICE = get_device()
 
 class DSOnlyMultiTaskModel(nn.Module):
     """
@@ -12,8 +15,7 @@ class DSOnlyMultiTaskModel(nn.Module):
     2. Readmission prediction within 15 days of discharge
     3. PHE codes in the next admission
     """
-    def __init__(self, DEVICE, hidden_dim, projection_dim, phe_code_size, 
-                 model_name="medicalai/ClinicalBERT"):
+    def __init__(self, DEVICE, hidden_dim, projection_dim, phe_code_size, pooling_type='weighted_sum', num_heads=4):
         """
         Initialize the DS-only multi-task model.
         
@@ -22,7 +24,8 @@ class DSOnlyMultiTaskModel(nn.Module):
             hidden_dim: Hidden dimension for the GRU
             projection_dim: Projection dimension for the DS encoder
             phe_code_size: Size of the PHE code vocabulary for the code prediction task
-            model_name: Name of the pretrained language model to use
+            pooling_type: Type of pooling to use for the DS encoder
+            num_heads: Number of attention heads for the DS encoder
         """
         super(DSOnlyMultiTaskModel, self).__init__()
         
@@ -33,10 +36,11 @@ class DSOnlyMultiTaskModel(nn.Module):
         self.phe_code_size = phe_code_size
         
         # DS Encoder with RNN for processing discharge summaries
-        self.ds_encoder = DSEncoderWithRNN(
-            rnn_hidden_dim=hidden_dim,
+        self.ds_encoder = DSEncoderWithWeightedSum(
+            hidden_dim=hidden_dim,
             projection_dim=projection_dim,
-            model_name=model_name
+            pooling_type=pooling_type,
+            num_heads=num_heads
         ).to(DEVICE)
         
         # Task-specific prediction heads
