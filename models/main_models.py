@@ -1,7 +1,7 @@
 # -*- coding:utf-8 -*-
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import *
+from train_utils import *
 from einops import *
 from einops import repeat
 import logging
@@ -12,7 +12,6 @@ from models.models_GCNadaptive import VSDGCRNN
 from models.models_GATGRU import VSDGATRNN
 from models.models_GATClusters import ClusterBasedVSDGATRNN
 from models.models_utils import Value_Encoder, Time_Encoder
-from utils import get_device
 
 # Get the device
 device = get_device()

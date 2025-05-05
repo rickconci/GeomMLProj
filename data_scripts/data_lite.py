@@ -18,7 +18,8 @@ import lmdb
 import time
 import joblib  # Add joblib for memory mapping
 import shutil
-from utils import get_device
+from pathlib import Path
+from train_utils import get_device
 
 
 
@@ -31,313 +32,232 @@ def debug_print(*args, **kwargs):
         print(*args, **kwargs)
 
 class MIMICContrastivePairsDatasetLite(Dataset):
-    def __init__(self, 
-                 split='train', 
-                 cache_dir='./cache', 
-                 task_mode='CONTRASTIVE',
+    def __init__(self,
+                 split="train",
+                 cache_dir="./cache",
+                 task_mode="CONTRASTIVE",
                  chunk_hours=12,
                  label_window=24,
-                 T = 80, 
-                 test_ds_only = False):
-        self.split = split
-        self.cache_dir = cache_dir
-        self.task_mode = task_mode
-        self.chunk_hours = chunk_hours
-        self.label_window = label_window
-        self.T = T
-        self.test_ds_only = test_ds_only
-        self.device = get_device()
-        # ------------- New: Load baseline DataFrame -------------
+                 T=80,
+                 test_ds_only=False):
+
+        self.split           = split
+        self.cache_dir       = cache_dir
+        self.task_mode       = task_mode
+        self.chunk_hours     = chunk_hours
+        self.label_window    = label_window
+        self.T               = T
+        self.test_ds_only    = test_ds_only
+        self.device          = get_device()
+
+        # ────────────────── label cache ──────────────────
+        label_dir = os.path.join(self.cache_dir, "label_cache")
+
+        # 1) row map
+        with open(os.path.join(label_dir, "hadm_row_map.pkl"), "rb") as f:
+            self._row = pickle.load(f)             # dict[int -> int]
+
+        N = len(self._row)
+
+        # 2) scalar labels
+        self._label_mm = np.memmap(os.path.join(label_dir, "labels_scalar.bin"),
+                                   dtype=np.uint8, mode="r").reshape(N, 2)
+        # 3) padded index matrices (mmap)
+        self._cur_mat = np.load(os.path.join(label_dir, "current_idx_mat.npy"), mmap_mode="r")
+        self._cur_len = np.load(os.path.join(label_dir, "current_len.npy"),     mmap_mode="r")
+        self._nxt_mat = np.load(os.path.join(label_dir, "next_idx_mat.npy"),    mmap_mode="r")
+        self._nxt_len = np.load(os.path.join(label_dir, "next_len.npy"),        mmap_mode="r")
+
+        self.K = self._cur_mat.shape[1]
+        self.P = int(self._cur_mat.max())
+
+        #
+
+        self.phecode_size = pickle.load(open(os.path.join(cache_dir, "phecode_size.pkl"), "rb"))
+        # ────────────────── baseline, embeddings, etc. ──────────────────
         baseline_path = os.path.join(cache_dir, "processed_baseline_df.pkl")
         try:
             self.baseline_df = pd.read_pickle(baseline_path)
-            print(f"Loaded baseline dataframe from: {baseline_path}")
+            print(f"Loaded baseline dataframe: {baseline_path}")
         except Exception as e:
-            print(f"Error loading baseline dataframe from {baseline_path}: {e}")
+            print(f"Baseline DF not found ({e}); continuing without.")
             self.baseline_df = None
 
-        # ------------- New: Set DS embeddings directory -------------
+        # ────────────────── ds embeddings ──────────────────
         self.ds_embeddings_dir = os.path.join(cache_dir, "DS_embeddings")
-        self.num_ds_embeddings = len(os.listdir(self.ds_embeddings_dir))
-        
-        # Check if directory exists
-        if not os.path.exists(self.ds_embeddings_dir):
-            print(f"DS embeddings directory not found. Creating {self.ds_embeddings_dir}")
-            os.makedirs(self.ds_embeddings_dir, exist_ok=True)
-            self.process_dfs()
+        os.makedirs(self.ds_embeddings_dir, exist_ok=True)
 
-        # 1) Load hadm_ids for this split.
-        self.merged_with_disch_df = pickle.load(open(os.path.join(cache_dir, "merged_with_disch_df_final_filtered.pkl"), "rb"))
-        print('loaded merged_with_disch_df')
-
+        merged_path = os.path.join(cache_dir, "merged_with_disch_df_final_filtered.pkl")
+        self.merged_with_disch_df = pd.read_pickle(merged_path)
         
+        # Ensure we have hadm_id as index for fast lookups
+        if self.merged_with_disch_df.index.name != "hadm_id":
+            self.merged_with_disch_df.set_index("hadm_id", inplace=True)
+        
+        if 'hadm_id' not in self.merged_with_disch_df.columns:
+            self.merged_with_disch_df['hadm_id'] = self.merged_with_disch_df.index
+
         self.hadm_ids = self.get_split_hadm_ids(split)
-    
-        # --- Index merged_with_disch_df by hadm_id for faster lookups --- 
-        if self.merged_with_disch_df.index.name != 'hadm_id':
-            print("Indexing merged_with_disch_df by hadm_id...")
-            self.merged_with_disch_df.set_index('hadm_id', inplace=True)
-            print("Indexing complete.")
-            print(f"Debug: Checking if hadm_id exists in index: {21086876 in self.merged_with_disch_df.index}")
-        # --- End indexing ---
 
-        # 3) Build self.samples.
-        if self.task_mode == 'NEXT_24h':
-            print(f"Computing samples for NEXT_24h task (this may take a while)...")
+        if self.task_mode == "NEXT_24h":
             self.compute_samples()
-            print(f"Computed {len(self.samples)} samples for NEXT_24h task.")
-            if len(self.samples) > 0 and DEBUG_PRINT:
-                print(f"First 3 samples: {self.samples[:3]}")
-                print(f"Last 3 samples: {self.samples[-3:]}")
-        else:
-            # CONTRASTIVE mode: one sample per hadm_id.
+        elif self.test_ds_only:
+            self.samples = list(self.ds_embeddings_dir.iterdir())
+        else: 
             self.samples = self.hadm_ids
+            
+        # Filter samples to only include those with valid cache files
+        if self.task_mode == 'CONTRASTIVE':
+            self.filter_valid_samples()
 
-    def process_dfs(self):
-        """Generate DS embeddings using process_dfs.py"""
-        print("No DS embeddings found. Generating them using process_dfs.py...")
-        try:
-            from data_scripts.process_dfs import MIMICDischargeNotesProcessor, get_ds_dataloader, DSEmbeddingExtractor
-            
-            # Initialize processor
-            print("Initializing discharge notes processor...")
-            processor = MIMICDischargeNotesProcessor(cache_dir=self.cache_dir)
-            
-            # Initialize dataloader with the correct cache_dir
-            print(f"Creating discharge notes dataloader with cache_dir: {self.cache_dir}")
-            dataloader = get_ds_dataloader(processor, cache_dir=self.cache_dir, batch_size=8)
-            
-            # Initialize embedding extractor
-            print("Initializing embedding extractor...")
-            extractor = DSEmbeddingExtractor().to(self.device)
-            extractor.eval()
-            
-            # Process and save embeddings
-            print("Extracting embeddings from discharge notes...")
-            for batch in tqdm(dataloader, desc="Extracting DS embeddings"):
-                hadm_ids = []
-                chunks_batch = []
-                for hadm_id, chunks in batch:
-                    hadm_ids.append(hadm_id)
-                    chunks_batch.append(chunks)
-                
-                with torch.no_grad():
-                    # Get embeddings
-                    batch_embeddings = extractor(chunks_batch)
-                
-                # Save each embedding tensor
-                for h_id, emb_tensor in zip(hadm_ids, batch_embeddings):
-                    save_path = os.path.join(self.ds_embeddings_dir, f"embedding_{h_id}.pt")
-                    torch.save(emb_tensor.cpu(), save_path)
-            
-            print(f"DS embeddings generated and saved to {self.ds_embeddings_dir}")
-        except Exception as e:
-            print(f"Error generating DS embeddings: {e}")
-            print("Continuing without DS embeddings. Some models may not work properly.")
+    def filter_valid_samples(self):
+        """Filter out hadm_ids that don't have corresponding cache files"""
+        joint_cache_dir = os.path.join(self.cache_dir, "precomputed_tensors")
+        os.makedirs(joint_cache_dir, exist_ok=True)
+        full_cache_fn = lambda hid: f"tensor_cache_{int(hid)}.pt"
         
-
-    def get_phecode_df(self):
-        base_path = '/Users/riccardoconci/Local_documents/!!MIMIC/hosp/'
-
-        # Check if phecode mappings already exist
-        phecode_mappings_path = os.path.join(self.cache_dir, "phecode_mappings.pkl")
-        if os.path.exists(phecode_mappings_path):
-            # Load existing mappings
-            mappings = pickle.load(open(phecode_mappings_path, "rb"))
-            self.phecode_to_idx = mappings['phecode_to_idx']
-            self.idx_to_phecode = mappings['idx_to_phecode']
-            self.phe_code_size = mappings['phe_code_size']
-            print(f"Loaded PHE code mappings with {self.phe_code_size} unique codes")
-            
-            # Also load the phecode dataframe if needed
-            if not hasattr(self, 'phecode_df') or self.phecode_df is None:
-                if os.path.exists(os.path.join(self.cache_dir, "phecode_df.pkl")):
-                    self.phecode_df = pickle.load(open(os.path.join(self.cache_dir, "phecode_df.pkl"), "rb"))
-            return
-
-        if os.path.exists(os.path.join(self.cache_dir, "phecode_df.pkl")):
-            self.phecode_df = pickle.load(open(os.path.join(self.cache_dir, "phecode_df.pkl"), "rb"))
-            
-            # Create mappings from the existing dataframe
-            unique_phecodes = sorted(self.phecode_df['PheCode'].unique())
-            self.phecode_to_idx = {code: idx for idx, code in enumerate(unique_phecodes)}
-            self.idx_to_phecode = {idx: code for idx, code in enumerate(unique_phecodes)}
-            self.phe_code_size = len(unique_phecodes)
-            
-            # Save the mappings
-            mappings = {
-                'phecode_to_idx': self.phecode_to_idx,
-                'idx_to_phecode': self.idx_to_phecode,
-                'phe_code_size': self.phe_code_size
-            }
-            pickle.dump(mappings, open(phecode_mappings_path, "wb"))
-            print(f"Created and saved PHE code mappings with {self.phe_code_size} unique codes")
-            return
-            
-        # If phecode dataframe doesn't exist, create it
-        print("Phecode labels not found in cache. Computing...")
-
-        icd_to_phe_mapping = pd.read_csv(base_path + 'icd_to_phecode.csv')
-        diagnoses_df = pd.read_csv(base_path + 'diagnoses_icd.csv')
-        diagnoses_names_df = pd.read_csv(base_path + 'd_icd_diagnoses.csv')
-        icd_to_phe_mapping.columns = ['icd_code','PheCode','icd_version']
-        icd_to_phe_mapping['icd_version'] = icd_to_phe_mapping['icd_version'].str.replace('ICD', '')
-
-        diagnoses_df['icd_version'] = diagnoses_df['icd_version'].astype(str)
-        icd_to_phe_mapping['icd_version'] = icd_to_phe_mapping['icd_version'].astype(str)
-        diagnoses_phecode = diagnoses_df.merge(icd_to_phe_mapping, on=['icd_code', 'icd_version'], how='left')
-
-        diagnoses_names_df['icd_version'] = diagnoses_names_df['icd_version'].astype(str)
-        diagnoses_names_df['icd_code'] = diagnoses_names_df['icd_code'].astype(str)
-        diagnoses_names_df['icd_version'] = diagnoses_names_df['icd_version'].astype(str)
-        diagnoses_phecode_names = diagnoses_phecode.merge(diagnoses_names_df, on=['icd_code', 'icd_version'], how='left')
-
-        diagnoses_phecode_names['Rollup_Status'] = diagnoses_phecode_names['PheCode'].notna().replace({True: '1', False: '0'})
-        diagnoses_phecode_names_filtered = diagnoses_phecode_names[diagnoses_phecode_names['Rollup_Status'] == '1']
-
-        # Save the phecode DataFrame
-        pickle.dump(diagnoses_phecode_names_filtered, open(os.path.join(self.cache_dir, "phecode_df.pkl"), "wb"))
-        self.phecode_df = diagnoses_phecode_names_filtered
+        valid_samples = []
+        invalid_count = 0
         
-        # Create and save the mappings
-        unique_phecodes = sorted(self.phecode_df['PheCode'].unique())
-        self.phecode_to_idx = {code: idx for idx, code in enumerate(unique_phecodes)}
-        self.idx_to_phecode = {idx: code for idx, code in enumerate(unique_phecodes)}
-        self.phe_code_size = len(unique_phecodes)
-        
-        mappings = {
-            'phecode_to_idx': self.phecode_to_idx,
-            'idx_to_phecode': self.idx_to_phecode,
-            'phe_code_size': self.phe_code_size
-        }
-        pickle.dump(mappings, open(phecode_mappings_path, "wb"))
-        print(f"Created and saved PHE code mappings with {self.phe_code_size} unique codes")
-        
-        # Index phecode_df by hadm_id for faster lookups
-        if self.phecode_df.index.name != 'hadm_id':
-            print("Indexing phecode_df by hadm_id...")
-            self.phecode_df.set_index('hadm_id', inplace=True)
-            print("Indexing complete.")
-        return
-
-    def _next_unique_admission(self, pa: pd.DataFrame, hadm_id: int) -> int | None:
-        """
-        Return the next distinct hadm_id after the given one, or None if none exists.
-        Expects pa to have columns ['hadm_id','admittime'].
-        """
-        unique_ads = (
-            pa[['hadm_id','admittime']]
-              .drop_duplicates(subset='hadm_id')
-              .sort_values('admittime')
-        )
-        hadm_list = unique_ads['hadm_id'].tolist()
-        try:
-            idx = hadm_list.index(hadm_id)
-            if idx + 1 < len(hadm_list):
-                return hadm_list[idx + 1]
-        except ValueError:
-            pass
-        return None
-
-    def get_post_discharge_label(self, hadm_id: int) -> dict:
-        """
-        Compute post-discharge outcomes for a specific hospital admission:
-          1. mortality_6m
-          2. readmission_15d
-          3. current_phecodes
-          4. next_phecodes
-
-        Returns:
-            dict
-        """
-        labels = {
-            'mortality_6m': 0,
-            'readmission_15d': 0,
-            'current_phecodes': [],
-            'next_phecodes': []
-        }
-        #print(f"hadm_id: {hadm_id}")
-        #print(self.merged_with_disch_df.loc[hadm_id])
-        try:
-            df = self.merged_with_disch_df
-            # Store original index state
-            original_index_name = df.index.name
-            
-            # First check if hadm_id exists
-            if original_index_name == 'hadm_id':
-                if hadm_id not in df.index:
-                    raise KeyError
-                raw = df.loc[hadm_id]
+        for hadm_id in tqdm(self.samples, desc="Filtering valid hadm_ids"):
+            path = os.path.join(joint_cache_dir, full_cache_fn(hadm_id))
+            if os.path.exists(path):
+                valid_samples.append(hadm_id)
             else:
-                if 'hadm_id' not in df.columns or hadm_id not in df['hadm_id'].values:
-                    raise KeyError
-                raw = df[df['hadm_id'] == hadm_id]
+                invalid_count += 1
+                if invalid_count <= 10:  # Only print first 10 to avoid spam
+                    print(f"Skipping hadm_id {hadm_id} - no cache file found")
+                elif invalid_count == 11:
+                    print("... more invalid hadm_ids ...")
+        
+        print(f"Filtered {invalid_count} invalid hadm_ids, {len(valid_samples)} remaining")
+        self.samples = valid_samples
 
-            patient_data = raw.iloc[0] if isinstance(raw, pd.DataFrame) else raw
-            dischtime    = pd.to_datetime(patient_data.get('dischtime'))
-            if pd.isna(dischtime):
-                return labels
+    def _fetch_labels(self, hadm_id: int):
+        """O(1) look-up of scalars + padded indices"""
+        row = self._row.get(int(hadm_id), None)
+        if row is None:
+            # unseen id (shouldn't happen after de-dup)
+            return 0, 0, torch.full((self.K,), self.P, dtype=torch.long), 0, \
+                   torch.full((self.K,), self.P, dtype=torch.long), 0
 
-            # 1) mortality within 6 months
-            dod = pd.to_datetime(patient_data.get('dod'))
-            if pd.notna(dod) and pd.Timedelta(0) < (dod - dischtime) <= pd.Timedelta(days=180):
-                labels['mortality_6m'] = 1
+        mort, readm = self._label_mm[row]
+        cur_pad = torch.from_numpy(self._cur_mat[row]).long()
+        cur_len = int(self._cur_len[row])
+        nxt_pad = torch.from_numpy(self._nxt_mat[row]).long()
+        nxt_len = int(self._nxt_len[row])
+        return mort, readm, cur_pad, cur_len, nxt_pad, nxt_len
 
-            # -- ensure phecode_df loaded --
-            if not hasattr(self, 'phecode_df') or self.phecode_df is None:
-                self.get_phecode_df()
-            pc_df = self.phecode_df
 
-            # 2) current admission phecodes
-            if pc_df is not None:
-                if pc_df.index.name == 'hadm_id':
-                    if hadm_id in pc_df.index:
-                        codes = pc_df.loc[hadm_id, 'PheCode']
-                    else:
-                        codes = []
-                else:
-                    subset = pc_df[pc_df['hadm_id'] == hadm_id]
-                    codes  = subset['PheCode'] if not subset.empty else []
-                labels['current_phecodes'] = pd.Series(codes).unique().tolist()
+  
+    def __len__(self):
+        return len(self.samples)
 
-            # 3) readmission & next admission phecodes
-            subject_id = patient_data.get('subject_id')
-            if subject_id is not None:
-                # Create a working copy for admissions lookup
-                admissions = df.copy()
-                if admissions.index.name == 'hadm_id':
-                    admissions = admissions.reset_index()
+    def __getitem__(self, idx):
+        # Prepare joint_cache_dir and full_cache_fn for all but test_ds_only
+        joint_cache_dir = os.path.join(self.cache_dir, "precomputed_tensors")
+        os.makedirs(joint_cache_dir, exist_ok=True)
+        full_cache_fn   = lambda hid: f"tensor_cache_{hid}.pt"
 
-                pa = admissions[admissions['subject_id'] == subject_id].copy()
-                pa['admittime'] = pd.to_datetime(pa['admittime'])
-                pa = pa.sort_values('admittime').reset_index(drop=True)
+        if self.test_ds_only:
+            #print(f"Getting item {idx} for test_ds_only")
+            ds_embeddings_list = os.listdir(self.ds_embeddings_dir)
+            hadm_id = ds_embeddings_list[idx].split('_')[1].split('.')[0]
+            #print(f"hadm_id: {hadm_id}")
 
-                next_hadm = self._next_unique_admission(pa, hadm_id)
-                if next_hadm is not None:
-                    next_row   = pa[pa['hadm_id'] == next_hadm].iloc[0]
-                    next_admit = pd.to_datetime(next_row['admittime'])
-                    if pd.Timedelta(0) < (next_admit - dischtime) <= pd.Timedelta(days=15):
-                        labels['readmission_15d'] = 1
+            embedding_path = os.path.join(self.ds_embeddings_dir, f"embedding_{hadm_id}.pt")
+            embedding = torch.load(embedding_path)
+            #print(f"embedding: {embedding.shape}")
+            mort, readm, cur_pad, cur_len, nxt_pad, nxt_len = self._fetch_labels(hadm_id)
 
-                    # next admission phecodes
-                    if pc_df is not None:
-                        if pc_df.index.name == 'hadm_id':
-                            if next_hadm in pc_df.index:
-                                codes = pc_df.loc[next_hadm, 'PheCode']
-                            else:
-                                codes = []
-                        else:
-                            subset = pc_df[pc_df['hadm_id'] == next_hadm]
-                            codes  = subset['PheCode'] if not subset.empty else []
-                        labels['next_phecodes'] = pd.Series(codes).unique().tolist()
+            return {
+                "hadm_id": int(hadm_id),
+                'values': torch.tensor([]),
+                'mask': torch.tensor([]),
+                'static': torch.tensor([]),
+                'times': torch.tensor([]),
+                'length': 0,
+                "mortality_label":   float(mort),
+                "readmission_label": float(readm),
+                "current_idx_padded": cur_pad,   # (K,)
+                "current_len":        cur_len,   # int
+                "next_idx_padded":    nxt_pad,   # (K,)
+                "next_len":           nxt_len,   # int
+                "ds_embedding":       embedding,
+            }
+        if self.task_mode == 'CONTRASTIVE':
+            hadm_id = self.samples[idx]
+            path = os.path.join(joint_cache_dir, full_cache_fn(hadm_id))
+            # No need to check if path exists since we've filtered the samples
+            physio, mask, abs_time, rel_time, full_length = torch.load(path)
+            ds_path = os.path.join(self.ds_embeddings_dir, f"embedding_{hadm_id}.pt")
+            # Return empty tensor instead of empty list when file not found
+            ds_emb = torch.load(ds_path) if os.path.exists(ds_path) else torch.zeros(0, 768)
 
-        except KeyError:
-            debug_print(f"Warning: hadm_id {hadm_id} not found.")
-        except Exception as e:
-            debug_print(f"Warning: error in get_post_discharge_label for {hadm_id}: {e}")
+            # Get post-discharge labels
+            mort, readm, cur_pad, cur_len, nxt_pad, nxt_len = self._fetch_labels(hadm_id)
 
-        return labels
+            return {
+                'hadm_id':      int(hadm_id),
+                'values':       physio,
+                'mask':         mask,
+                'static':       self.get_baseline(hadm_id),
+                'times':        abs_time,
+                'length':       int(full_length),
+                "mortality_label":   float(mort),
+                "readmission_label": float(readm),
+                "current_idx_padded": cur_pad,   # (K,)
+                "current_len":        cur_len,   # int
+                "next_idx_padded":    nxt_pad,   # (K,)
+                "next_len":           nxt_len,   # int
+                "ds_embedding":       ds_emb,
+            }
+        elif self.task_mode == 'NEXT_24h':
+            hadm_id, chunk_idx, label = self.samples[idx]
+            cutoff_hr = chunk_idx * self.chunk_hours
 
+            path = os.path.join(joint_cache_dir, full_cache_fn(hadm_id))
+            if not os.path.exists(path):
+                return None
+            physio, mask, abs_time, rel_time, _ = torch.load(path)
+
+            # compute slice_end
+            rel_np    = rel_time.cpu().numpy()
+            slice_end = np.searchsorted(rel_np, cutoff_hr, side='right')
+            slice_end = max(1, slice_end)
+
+            # slice + pad
+            physio_slice = self.pad_tensor(physio[:slice_end], self.T)
+            mask_slice   = self.pad_tensor(mask[:slice_end],   self.T)
+            time_slice   = self.pad_tensor(abs_time[:slice_end], self.T)
+
+            length = int((mask_slice.sum(dim=1) > 0).sum().item())
+
+            # Get post-discharge labels
+            mort, readm, cur_pad, cur_len, nxt_pad, nxt_len = self._fetch_labels(hadm_id)
+
+            ds_path = os.path.join(self.ds_embeddings_dir, f"embedding_{hadm_id}.pt")
+            ds_emb  = torch.load(ds_path) if os.path.exists(ds_path) else torch.zeros(0, 768)
+
+            return {
+                'hadm_id':      int(hadm_id),
+                'values':       physio_slice,
+                'mask':         mask_slice,
+                'static':       self.get_baseline(hadm_id),
+                'times':        time_slice,
+                'length':       length,
+                'label':        int(label),
+                "mortality_label":   float(mort),
+                "readmission_label": float(readm),
+                "current_idx_padded": cur_pad,   # (K,)
+                "current_len":        cur_len,   # int
+                "next_idx_padded":    nxt_pad,   # (K,)
+                "next_len":           nxt_len,   # int
+                "ds_embedding":       ds_emb,
+            }
+        else:
+            raise ValueError(f"Bad mode {self.task_mode}")
+    
     def compute_samples(self, cache_file=None):
         """
         Compute and cache samples for the NEXT_24h task.
@@ -436,121 +356,6 @@ class MIMICContrastivePairsDatasetLite(Dataset):
         except Exception as e:
             print(f"Failed to save cache: {e}")
 
-    def __len__(self):
-        if self.test_ds_only:
-            return self.num_ds_embeddings
-        else:
-            return len(self.samples)
-
-    def __getitem__(self, idx):
-        if self.test_ds_only:
-            #print(f"Getting item {idx} for test_ds_only")
-            ds_embeddings_list = os.listdir(self.ds_embeddings_dir)
-            hadm_id = ds_embeddings_list[idx].split('_')[1].split('.')[0]
-            #print(f"hadm_id: {hadm_id}")
-
-            embedding_path = os.path.join(self.ds_embeddings_dir, f"embedding_{hadm_id}.pt")
-            embedding = torch.load(embedding_path)
-            #print(f"embedding: {embedding.shape}")
-
-            post_discharge_labels = self.get_post_discharge_label(int(hadm_id))
-            mortality_label = post_discharge_labels['mortality_6m']
-            readmission_label = post_discharge_labels['readmission_15d']
-            next_phecodes = post_discharge_labels['next_phecodes']
-            print(f"hadm_id: {hadm_id}, mortality_label: {mortality_label}, readmission_label: {readmission_label}, next_phecodes: {next_phecodes}")
-            
-            output = {
-                'hadm_id': hadm_id,
-                'values': torch.tensor([]), 
-                'mask': torch.tensor([]),
-                'static': torch.tensor([]),
-                'times': torch.tensor([]),
-                'length': 0,
-                'mortality_label': int(mortality_label),
-                'readmission_label': int(readmission_label),
-                'next_phecodes': next_phecodes,
-                'ds_embedding': embedding,
-            }
-            return output
-        else:
-            # Common loader for the "full" cache
-            joint_cache_dir = os.path.join(self.cache_dir, "precomputed_tensors")
-            os.makedirs(joint_cache_dir, exist_ok=True)
-            full_cache_fn   = lambda hid: f"tensor_cache_{hid}.pt"
-    
-        if self.task_mode == 'CONTRASTIVE':
-            hadm_id = self.samples[idx]
-            path    = os.path.join(joint_cache_dir, full_cache_fn(hadm_id))
-            if not os.path.exists(path):
-                raise ValueError(f"No cache for {hadm_id}")
-            
-            physio, mask, abs_time, rel_time, full_length = torch.load(path)
-            ds_path = os.path.join(self.ds_embeddings_dir, f"embedding_{hadm_id}.pt")
-            ds_emb  = torch.load(ds_path) if os.path.exists(ds_path) else []
-    
-            # Get post-discharge labels
-            post_discharge_labels = self.get_post_discharge_label(hadm_id)
-            mortality_label = post_discharge_labels['mortality_6m']
-            readmission_label = post_discharge_labels['readmission_15d']
-            next_phecodes = post_discharge_labels['next_phecodes']
-
-            return {
-                'hadm_id':      int(hadm_id),
-                'values':       physio,
-                'mask':         mask,
-                'static':       self.get_baseline(hadm_id),
-                'times':        abs_time,
-                'length':       int(full_length),
-                'mortality_label': int(mortality_label),
-                'readmission_label': int(readmission_label),
-                'next_phecodes': next_phecodes,
-                'ds_embedding': ds_emb or [],
-            }
-    
-        elif self.task_mode == 'NEXT_24h':
-            hadm_id, chunk_idx, label = self.samples[idx]
-            cutoff_hr = chunk_idx * self.chunk_hours
-    
-            path = os.path.join(joint_cache_dir, full_cache_fn(hadm_id))
-            if not os.path.exists(path):
-                return None
-            physio, mask, abs_time, rel_time, _ = torch.load(path)
-    
-            # compute slice_end
-            rel_np    = rel_time.cpu().numpy()
-            slice_end = np.searchsorted(rel_np, cutoff_hr, side='right')
-            slice_end = max(1, slice_end)
-    
-            # slice + pad
-            physio_slice = self.pad_tensor(physio[:slice_end], self.T)
-            mask_slice   = self.pad_tensor(mask[:slice_end],   self.T)
-            time_slice   = self.pad_tensor(abs_time[:slice_end], self.T)
-    
-            length = int((mask_slice.sum(dim=1) > 0).sum().item())
-            
-            # Get post-discharge labels
-            post_discharge_labels = self.get_post_discharge_label(hadm_id)
-            mortality_label = post_discharge_labels['mortality_6m']
-            readmission_label = post_discharge_labels['readmission_15d']
-            next_phecodes = post_discharge_labels['next_phecodes']
-    
-            return {
-                'hadm_id':      int(hadm_id),
-                'values':       physio_slice,
-                'mask':         mask_slice,
-                'static':       self.get_baseline(hadm_id),
-                'times':        time_slice,
-                'length':       length,
-                'label':        int(label),  # Original mortality label for NEXT_24h task
-                'mortality_label': int(mortality_label),
-                'readmission_label': int(readmission_label),
-                'next_phecodes': next_phecodes,
-                'ds_embedding': [],
-            }
-    
-        else:
-            raise ValueError(f"Bad mode {self.task_mode}")
-    
     def pad_tensor(self, tensor, target_length):
         current_length = tensor.shape[0]
         if current_length < target_length:
@@ -604,7 +409,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             
         # Verify the ratios sum to 1.0
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-10, "Ratios must sum to 1.0"
-        
+            
         # Get unique subject_ids
         unique_subjects = df['subject_id'].unique()
         
@@ -622,11 +427,11 @@ class MIMICContrastivePairsDatasetLite(Dataset):
         val_subjects = unique_subjects[train_idx:val_idx]
         test_subjects = unique_subjects[val_idx:]
         
-        # Get hadm_ids for each split
+        # Get hadm_ids for each split - now we can access hadm_id as a column
         train_hadm_ids = df[df['subject_id'].isin(train_subjects)]['hadm_id'].tolist()
         val_hadm_ids = df[df['subject_id'].isin(val_subjects)]['hadm_id'].tolist()
         test_hadm_ids = df[df['subject_id'].isin(test_subjects)]['hadm_id'].tolist()
-        
+            
         # Store the splits
         self.train_hadm_ids = train_hadm_ids
         self.val_hadm_ids = val_hadm_ids
@@ -648,7 +453,8 @@ class MIMICContrastivePairsDatasetLite(Dataset):
         Returns:
             list: Hospital admission IDs for the specified split
         """
-        self.split_by_subject_id(self.merged_with_disch_df)
+        # Use a copy to avoid modifying the original DataFrame
+        self.split_by_subject_id(self.merged_with_disch_df.copy())
         if split == 'train':
             return self.train_hadm_ids
         elif split == 'val':
@@ -657,6 +463,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
             return self.test_hadm_ids
         else:
             raise ValueError(f"Unknown split: {split}. Must be one of 'train', 'val', 'test'")
+
 
 
 

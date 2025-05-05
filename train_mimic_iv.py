@@ -9,13 +9,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import dotenv
-from utils import contrastive_loss, count_parameters, detailed_count_parameters, plot_first_sample, plot_mask_heatmap
+from GeomMLProj.train_utils import contrastive_loss, count_parameters, detailed_count_parameters, plot_first_sample, plot_mask_heatmap
 from models.main_models import KEDGN, DSEncoderWithRNN
+from models.models_rd import Raindrop_v2
 from models.models_utils import ProjectionHead
 from tqdm import tqdm 
 import json
 from pathlib import Path
-from utils import device, log_batch_metrics
+from GeomMLProj.train_utils import device, log_batch_metrics
 
 from dataloader_lite import get_dataloaders
 
@@ -24,6 +25,56 @@ def debug_print(*args, **kwargs):
         if DEBUG_PRINTS:
             print(*args, **kwargs)
 
+# Create a wrapper class for Raindrop_v2 to make it compatible with our training pipeline
+class RaindropModel(torch.nn.Module):
+    def __init__(self, DEVICE, d_inp, d_model, nhead, nhid, nlayers, dropout, max_len, 
+                 d_static, n_class, global_structure=None, sensor_wise_mask=False, static=True):
+        super().__init__()
+        
+        self.model = Raindrop_v2(
+            d_inp=d_inp,
+            d_model=d_model,
+            nhead=nhead,
+            nhid=nhid,
+            nlayers=nlayers,
+            dropout=dropout,
+            max_len=max_len,
+            d_static=d_static,
+            n_classes=n_class,
+            global_structure=global_structure,
+            sensor_wise_mask=sensor_wise_mask,
+            static=static
+        )
+        
+        self.DEVICE = DEVICE
+        
+    def forward(self, P, P_static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor):
+        """
+        Wrapper method to maintain compatibility with KEDGN's input format
+        
+        Args:
+            P: Combined values and mask tensor [B, T, F*2]
+            P_static: Static features [B, S]
+            P_avg_interval: Average interval tensor (not used) 
+            P_length: Sequence lengths [B, 1]
+            P_time: Timestamps [B, T]
+            P_var_plm_rep_tensor: Variable embeddings (not used)
+            
+        Returns:
+            Tuple of (output, distance, None) to match KEDGN's return format
+        """
+        # Convert inputs to the format expected by Raindrop_v2
+        src = P.permute(1, 0, 2)  # [T, B, F*2]
+        static = P_static
+        times = P_time.permute(1, 0)  # [T, B]
+        lengths = P_length.squeeze(1)  # [B]
+        
+        # Forward pass through Raindrop_v2
+        output, distance, _ = self.model(src, static, times, lengths)
+        
+        # Return in a format compatible with how we process KEDGN outputs
+        return output, output, output  # Using output three times to match (outputs, aggregated_hidden, fused_features)
+            
 def main(args):
     print(args)
 
@@ -34,18 +85,6 @@ def main(args):
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-
-    # Set device - try MPS first, then CUDA, then fall back to CPU
-    if torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print("Using MPS device")
-    elif torch.cuda.is_available():
-        device = torch.device('cuda:0')
-        print("Using CUDA device")
-    else:
-        device = torch.device('cpu')
-        print("Using CPU device")
-
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True)
@@ -89,8 +128,6 @@ def main(args):
     # Run five experiments
     for k in range(5):
 
-       
-
         # Set different random seed for each run
         torch.manual_seed(k)
         torch.cuda.manual_seed(k)
@@ -108,9 +145,8 @@ def main(args):
         P_var_plm_rep_tensor = P_var_plm_rep_tensor.to(device)
 
         
-        # Try to get a valid batch from the train loader
         valid_batch_found = False
-        max_attempts = 10  # Set a reasonable limit to avoid infinite loops
+        max_attempts = 10 
         attempt = 0
         
         train_iter = iter(train_loader)
@@ -176,27 +212,64 @@ def main(args):
         print(f"d_static: {d_static}, n_class: {n_class}, variables_num: {variables_num}, actual_ts_dim: {actual_ts_dim}, P_var_plm_rep_tensor: {P_var_plm_rep_tensor.shape}, labels: {labels.shape}")
 
         # Add debug output for model initialization
-        debug_print("Initializing KEDGN model...")
+        debug_print("Initializing model...")
         start_time = time.time()
         
-        # Initialize KEDGN model
-        model = KEDGN(DEVICE=device,
-                    hidden_dim=hidden_dim,
-                    num_of_variables=variables_num,
-                    num_of_timestamps=actual_ts_dim,
-                    d_static=d_static,
-                    n_class=1,
-                    rarity_alpha=rarity_alpha,
-                    query_vector_dim=query_vector_dim,
-                    node_emb_dim=node_emb_dim,
-                    plm_rep_dim=plm_rep_dim,
-                    use_gat=args.use_gat,
-                    num_heads=args.num_heads,
-                    use_adj_mask=args.use_adj_mask,
-                    use_clusters=args.use_clusters,
-                    task_mode=args.task_mode)
+        # Load global structure for Raindrop if provided
+        global_structure = None
+        if args.model_type == 'raindrop_v2' and args.global_structure_path:
+            if os.path.exists(args.global_structure_path):
+                try:
+                    global_structure = torch.load(args.global_structure_path)
+                    print(f"Loaded global structure with shape {global_structure.shape}")
+                except Exception as e:
+                    print(f"Error loading global structure: {e}")
+                    print("Initializing with default fully-connected structure")
+                    global_structure = torch.ones(variables_num, variables_num)
+            else:
+                print(f"Global structure file {args.global_structure_path} not found")
+                print("Initializing with default fully-connected structure")
+                global_structure = torch.ones(variables_num, variables_num)
         
-        debug_print(f"KEDGN model initialized in {time.time() - start_time:.2f} seconds")
+        # Initialize model based on selected type
+        if args.model_type == 'raindrop_v2':
+            # For Raindrop, d_inp should be half of the input size since it expects the second half to be masks
+            model = RaindropModel(
+                DEVICE=device,
+                d_inp=variables_num // 2,  # Raindrop expects d_inp to be half of the input size
+                d_model=args.d_model, 
+                nhead=args.num_heads, 
+                nhid=args.hidden_dim, 
+                nlayers=args.nlayers, 
+                dropout=0.3, 
+                max_len=actual_ts_dim, 
+                d_static=d_static,
+                n_class=n_class,
+                global_structure=global_structure,
+                sensor_wise_mask=args.sensor_wise_mask,
+                static=(d_static > 0)
+            )
+            print(f"Initialized Raindrop_v2 model with {variables_num // 2} input features")
+        else:  # Default to KEDGN
+            # Initialize KEDGN model
+            model = KEDGN(DEVICE=device,
+                        hidden_dim=hidden_dim,
+                        num_of_variables=variables_num,
+                        num_of_timestamps=actual_ts_dim,
+                        d_static=d_static,
+                        n_class=n_class,
+                        rarity_alpha=rarity_alpha,
+                        query_vector_dim=query_vector_dim,
+                        node_emb_dim=node_emb_dim,
+                        plm_rep_dim=plm_rep_dim,
+                        use_gat=args.use_gat,
+                        num_heads=args.num_heads,
+                        use_adj_mask=args.use_adj_mask,
+                        use_clusters=args.use_clusters,
+                        task_mode=args.task_mode)
+            print(f"Initialized KEDGN model with {variables_num} input features")
+        
+        debug_print(f"Model initialized in {time.time() - start_time:.2f} seconds")
         
         # If using contrastive learning, add text encoder and projection heads
         if args.task_mode == 'CONTRASTIVE':
@@ -391,6 +464,12 @@ def main(args):
                 backprop_time = time.time() - backprop_start_time
                 debug_print('backprop time:', backprop_time)
                 
+                # Add graph distance regularization for Raindrop_v2
+                if args.model_type == 'raindrop_v2' and isinstance(model, RaindropModel) and hasattr(outputs, 'distance') and outputs.distance is not None:
+                    graph_distance_factor = 0.1  # Hyperparameter for graph distance regularization
+                    graph_loss = outputs.distance * graph_distance_factor
+                    loss += graph_loss
+                
                 # Add gradient clipping to prevent exploding gradients and NaN values
                 #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
@@ -542,11 +621,13 @@ def main(args):
                 val_loss /= len(val_loader)
                 
                 # After computing validation metrics, create an organized checkpoint filename
-                checkpoint_base = f"{dataset}_{args.task_mode}" 
-                if args.use_gat:
+                checkpoint_base = f"{dataset}_{args.task_mode}_{args.model_type}" 
+                if args.model_type == 'kedgn' and args.use_gat:
                     checkpoint_base += f"_GAT{args.num_heads}"
-                else:
+                elif args.model_type == 'kedgn':
                     checkpoint_base += "_GCN"
+                elif args.model_type == 'raindrop_v2':
+                    checkpoint_base += f"_L{args.nlayers}_H{args.num_heads}"
                 checkpoint_base += f"_run{k}"
                 
                 # Early stopping logic based on selected metric
@@ -657,11 +738,13 @@ def main(args):
         model.eval()
         if model_saved:
             # Try to load best checkpoint first, then fall back to older method
-            checkpoint_base = f"{dataset}_{args.task_mode}" 
-            if args.use_gat:
+            checkpoint_base = f"{dataset}_{args.task_mode}_{args.model_type}" 
+            if args.model_type == 'kedgn' and args.use_gat:
                 checkpoint_base += f"_GAT{args.num_heads}"
-            else:
+            elif args.model_type == 'kedgn':
                 checkpoint_base += "_GCN"
+            elif args.model_type == 'raindrop_v2':
+                checkpoint_base += f"_L{args.nlayers}_H{args.num_heads}"
             checkpoint_base += f"_run{k}"
             checkpoint_filename = os.path.join(checkpoint_dir, f"{checkpoint_base}_best.pt")
             
@@ -677,6 +760,12 @@ def main(args):
                 model.load_state_dict(torch.load(model_path_full, map_location=device))
         else:
             print("No model was saved during training. Using the final model state for testing.")
+        
+        # Print model specific information
+        if args.model_type == 'raindrop_v2':
+            print(f"Testing Raindrop_v2 model with {args.nlayers} layers and {args.num_heads} attention heads")
+        else:
+            print(f"Testing KEDGN model with GAT={args.use_gat}, num_heads={args.num_heads}")
         
         test_probs_all = []
         test_labels_all = []
@@ -779,11 +868,13 @@ def main(args):
         auroc_arr.append(test_auroc * 100)
 
     print('args.dataset', args.dataset)
+    print('args.model_type', args.model_type)
     # Display the mean and standard deviation of five runs
     mean_acc, std_acc = np.mean(acc_arr), np.std(acc_arr)
     mean_auprc, std_auprc = np.mean(auprc_arr), np.std(auprc_arr)
     mean_auroc, std_auroc = np.mean(auroc_arr), np.std(auroc_arr)
     print('------------------------------------------')
+    print(f'Model: {args.model_type.upper()}')
     print('Accuracy = %.1f±%.1f' % (mean_acc, std_acc))
     print('AUPRC    = %.1f±%.1f' % (mean_auprc, std_auprc))
     print('AUROC    = %.1f±%.1f' % (mean_auroc, std_auroc))
@@ -791,6 +882,7 @@ def main(args):
     # Log final metrics to wandb if enabled
     if args.use_wandb:
         wandb.log({
+            "model_type": args.model_type,
             "final_mean_acc": mean_acc,
             "final_std_acc": std_acc,
             "final_mean_auprc": mean_auprc,
@@ -872,6 +964,16 @@ if __name__== "__main__":
     parser.add_argument('--resume_from_checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--save_all_checkpoints', action='store_true', help='Save a checkpoint after every epoch')
     parser.add_argument('--clean_LMDB_cache', action='store_true', help='Clean LMDB cache before starting')
+    
+    # Add Raindrop-specific arguments
+    parser.add_argument('--model_type', type=str, default='kedgn', choices=['kedgn', 'raindrop_v2'], 
+                        help='Model type to use (KEDGN or Raindrop_v2)')
+    parser.add_argument('--d_model', type=int, default=64, help='Raindrop model dimension')
+    parser.add_argument('--nlayers', type=int, default=2, help='Number of transformer layers for Raindrop')
+    parser.add_argument('--global_structure_path', type=str, default=None, 
+                        help='Path to adjacency matrix file defining sensor relationships')
+    parser.add_argument('--sensor_wise_mask', action='store_true', 
+                        help='Use sensor-wise masking for Raindrop_v2')
 
     args = parser.parse_args()
     

@@ -1,7 +1,8 @@
 # -*- coding:utf-8 -*-
 import torch.nn as nn
+
 import torch.nn.functional as F
-from utils import *
+from train_utils import *
 from einops import *
 from einops import repeat
 import logging
@@ -9,17 +10,7 @@ import math
 import os
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from models.models_utils import MLP, MLP_Param
-from utils import get_device
 
-if torch.backends.mps.is_available():
-    device = torch.device('mps')
-    print("Using MPS device")
-elif torch.cuda.is_available():
-    device = torch.device('cuda:0')
-    print("Using CUDA device")
-else:
-    device = torch.device('cpu')
-    print("Using CPU device")
 
 
 # Configure logging for debugging - file only, no console output

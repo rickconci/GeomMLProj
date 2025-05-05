@@ -1,14 +1,13 @@
 # -*- coding:utf-8 -*-
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import *
+from train_utils import *
 from einops import *
 from einops import repeat
 import logging
 import math
 import os
 from models.models_utils import MLP_Param, MLP
-from utils import get_device
 
 
 

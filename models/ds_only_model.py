@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from models.main_models import DSEncoderWithWeightedSum
-from utils import get_device
+from train_utils import get_device
 
 DEVICE = get_device()
 

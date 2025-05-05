@@ -8,3 +8,5 @@ wandb/
 *data/
 .env 
 copy_dir_lambda.sh
+lightning_logs/
+checkpoints/

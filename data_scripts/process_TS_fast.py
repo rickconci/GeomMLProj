@@ -119,9 +119,9 @@ def process_hadm(hadm_group, name_list, T, cache_dir):
 # 4. Main workflow: Load DataFrame, preprocess, and run parallel processing
 # =============================================================================
 if __name__ == '__main__':
-    # Setup paths relative to this script.
-    ROOT_DIR = Path(__file__).resolve().parent
-    temp_dfs_dir = ROOT_DIR / "temp_dfs"
+    # Setup paths relative to current working directory.
+    ROOT_DIR = Path.cwd()
+    temp_dfs_dir = ROOT_DIR / "temp_dfs_lite"
     input_pkl = temp_dfs_dir / "sorted_filtered_df.pkl"
     cache_dir = temp_dfs_dir / "precomputed_tensors"
     

@@ -75,6 +75,62 @@ python train_lightning.py --dataset physionet --use_gat --num_heads 2
 python train_lightning.py --dataset physionet --use_transformer --history_len 15 --nhead_transformer 2 --use_gat --num_heads 2
 ```
 
+### Multi-Task Models
+
+The repository also includes implementations of multi-task models for predicting multiple healthcare outcomes simultaneously.
+
+#### MultiTaskKEDGN
+
+Extends the KEDGN model to predict:
+
+1. Mortality prediction within 6 months of discharge
+2. Readmission prediction within 15 days of discharge
+3. PHE codes in the next admission
+
+```bash
+python train_multi_task.py --model_type full --hidden_dim 256 --lr 0.001
+```
+
+#### DS-Only MultiTask Model
+
+A simpler model that uses only the discharge summary embeddings for predictions:
+
+```bash
+python train_multi_task.py --model_type ds_only --hidden_dim 256 --projection_dim 512
+```
+
+#### MultiTaskRaindropV2
+
+An implementation that adapts the Raindrop_v2 architecture for multi-task prediction. Raindrop_v2 is a time series model that handles complex relationships between sensors through a specialized observation propagation mechanism and transformer architecture.
+
+**Input data requirements:**
+
+- Time series data with shape `[max_len, batch_size, 2*d_inp]` (first half contains sensor readings, second half contains missing value masks)
+- Static/demographic features with shape `[batch_size, d_static]`
+- Timestamps with shape `[max_len, batch_size]`
+- Valid sequence lengths for each sample with shape `[batch_size]`
+- Global structure (adjacency matrix) defining sensor relationships with shape `[d_inp, d_inp]`
+
+**Key features:**
+
+- Observation propagation mechanism that models relationships between variables
+- Integration of transformer architecture for temporal patterns
+- Attention mechanisms that account for missing data
+- Multi-task prediction heads for mortality, readmission, and PHE codes
+
+**Usage:**
+
+```bash
+python train_multi_task.py --model_type raindrop_v2 --hidden_dim 128 --d_model 64 --num_heads 4 --nlayers 2
+```
+
+**Additional RaindropV2 parameters:**
+
+- `--d_model`: Number of expected model input features (default: 64)
+- `--nlayers`: Number of transformer encoder layers (default: 2)
+- `--global_structure`: Path to adjacency matrix file defining sensor relationships
+- `--sensor_wise_mask`: Enable sensor-wise masking
+
 ## Command Line Arguments
 
 - `--dataset`: Dataset name ('physionet', 'P12', 'P19', 'mimic3')

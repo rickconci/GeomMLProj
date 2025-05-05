@@ -51,20 +51,16 @@ def custom_collate_fn(batch):
     # 2) pull out ds_embedding (list of [num_chunks × hidden_dim] tensors)
     ds_embeddings = [b.pop('ds_embedding') for b in batch]
     
-    # 3) extract and handle next_phecodes list separately (variable length lists)
-    next_phecodes = None
-    if 'next_phecodes' in batch[0]:
-        next_phecodes = [b.pop('next_phecodes') for b in batch]
-
-    # 4) now everything left is either:
+    # 3) now everything left is either:
     #    - a Python int (hadm_id, length, label, mortality_label, readmission_label)
     #    - a fixed-size torch.Tensor (values, mask, static, times)
     collated = default_collate(batch)
 
-    # 5) re-attach your lists of variable-length data
+    # 4) re-attach your lists of variable-length data
     collated['ds_embedding'] = ds_embeddings
-    if next_phecodes is not None:
-        collated['next_phecodes'] = next_phecodes
+    
+    # 5) Add compatibility key for models expecting 'discharge_embeddings'
+    collated['discharge_embeddings'] = ds_embeddings
         
     return collated
 
@@ -158,4 +154,3 @@ def get_dataloaders(data_path, temp_dfs_path='temp_dfs', batch_size=64,
     test_loader = DataLoader(test_dataset, **test_kwargs)
 
     return train_loader, val_loader, test_loader, embeddings
-    

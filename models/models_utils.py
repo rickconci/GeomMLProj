@@ -1,13 +1,13 @@
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import *
+from train_utils import *
 from einops import *
 from einops import repeat
 import logging
 import math
 import os
 from transformers import AutoTokenizer, AutoModelForMaskedLM
-from utils import get_device
+from train_utils import get_device
 
 
 def get_device_info():
@@ -18,17 +18,6 @@ def get_device_info():
         return "CUDA"
     else:
         return "CPU"
-
-
-if torch.backends.mps.is_available():
-    device = torch.device('mps')
-    print("Using MPS device")
-elif torch.cuda.is_available():
-    device = torch.device('cuda:0')
-    print("Using CUDA device")
-else:
-    device = torch.device('cpu')
-    print("Using CPU device")
 
 
 # Configure logging for debugging - file only, no console output
@@ -43,19 +32,20 @@ logging.basicConfig(
 
 
 class ProjectionHead(torch.nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim=None, output_dim=128):
         super().__init__()
+        # If hidden_dim is not provided, use the output_dim
+        if hidden_dim is None:
+            hidden_dim = output_dim
+            
         self.projection = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, output_dim),
+            torch.nn.Linear(input_dim, hidden_dim),
             torch.nn.ReLU(),
-            torch.nn.Linear(output_dim, output_dim)
+            torch.nn.Linear(hidden_dim, output_dim)
         )
         
     def forward(self, x):
         return self.projection(x)
-
-
-
 
 
 
@@ -217,3 +207,41 @@ class VariableTransformerCell(nn.Module):
         hidden = self.projection(last_state)
         
         return hidden
+
+
+
+
+class ConvNetMLP(nn.Module):
+    def __init__(self, hidden_size, final_dim, kernel_size=3):
+        """
+        Args:
+            hidden_size (int): Dimensionality of the transformer hidden states.
+            final_dim (int): Desired dimensionality of the final embedding.
+            kernel_size (int): Kernel size for the Conv1D layer (default: 3).
+        """
+        super(ConvNetMLP, self).__init__()
+        # Conv1d expects input as (batch_size, channels, sequence_length)
+        self.conv1 = nn.Conv1d(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2  # to preserve sequence length
+        )
+        self.relu = nn.ReLU()
+        self.pool = nn.AdaptiveMaxPool1d(output_size=1)
+        self.fc = nn.Linear(hidden_size, final_dim)
+        
+    def forward(self, hidden_states):
+        """
+        Args:
+            hidden_states (torch.Tensor): Tensor of shape (batch_size, seq_length, hidden_size)
+        Returns:
+            torch.Tensor: Final embeddings of shape (batch_size, final_dim)
+        """
+        x = hidden_states.transpose(1, 2)  # shape: (batch_size, hidden_size, seq_length)
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.pool(x)   # shape: (batch_size, hidden_size, 1)
+        x = x.squeeze(-1)  # shape: (batch_size, hidden_size)
+        return self.fc(x)  # shape: (batch_size, final_dim)
+            

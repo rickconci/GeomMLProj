@@ -75,6 +75,7 @@ class MultiTaskKEDGN(KEDGN):
         # Move all classifiers to the correct device
         self.mortality_classifier.to(DEVICE)
         self.readmission_classifier.to(DEVICE)
+        self.phecode_classifier.to(DEVICE)
         
         logging.info(f"MultiTaskKEDGN initialized with PHE code size: {phe_code_size}")
     
