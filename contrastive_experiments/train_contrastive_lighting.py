@@ -37,7 +37,9 @@ from models.models_rd import Raindrop_v2
 from models.models_utils import ProjectionHead
 
 from ContrastiveDataloaderLighting import ContrastiveDataModule
-from RaindropContrastive_lightning import RaindropContrastiveModel, get_model
+from RaindropContrastive_lightning import RaindropContrastiveModel
+# Import the downstream evaluation function - ensure it's using the correct path
+from contrastive_experiments.train_downstream_heads import train_downstream_tasks
 
 # Set up logging
 logging.basicConfig(
@@ -62,8 +64,20 @@ def main(args):
     # Disable debug printing
     toggle_debug(False)
     
+    args.checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+    
     # Create directories
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    # Log key parameters and directories
+    logging.info(f"Starting contrastive training with:")
+    logging.info(f"  Working directory: {os.getcwd()}")
+    logging.info(f"  Checkpoint directory (abs): {args.checkpoint_dir}")
+    logging.info(f"  Epochs: {args.epochs}")
+    logging.info(f"  Batch size: {args.batch_size}")
+    logging.info(f"  Learning rate: {args.lr}")
+    logging.info(f"  Projection dimension: {args.projection_dim}")
+    logging.info(f"  Use PHEcode loss: {args.use_phecode_loss}")
     
     # Initialize data module
     data_module = ContrastiveDataModule(
@@ -73,9 +87,20 @@ def main(args):
         num_workers=args.num_workers,
         task_mode='CONTRASTIVE'
     )
+
+    dims = {
+        'variables_num': 80,
+        'timestamps': 80,
+        'd_static': 83,
+        'ds_emb_dim': 768,
+        'values_shape': (args.batch_size, 80, 80), # (batch_size, timestamps, variables_num)
+        'phecode_size': 1788,
+        'phecode_loss_weight': 0.2,
+        'sensor_wise_mask': True
+    }
     
-    # Initialize model with data module
-    model = get_model(args, data_module)
+    # Initialize model with data module and hardcoded dimensions
+    model = RaindropContrastiveModel(args, dims=dims)
     
     # Configure callbacks
     callbacks = []
@@ -88,9 +113,19 @@ def main(args):
         mode='min',
         save_top_k=1 if not args.save_all_checkpoints else -1,
         save_last=True,
-        verbose=True
+        verbose=True,
+        every_n_epochs=1,  # Save checkpoint every epoch
+        save_on_train_epoch_end=True  # Ensure it saves at the end of training epoch
     )
     callbacks.append(checkpoint_callback)
+    
+    # Log checkpoint configuration
+    logging.info(f"Checkpoint configuration:")
+    logging.info(f"  Directory: {checkpoint_callback.dirpath}")
+    logging.info(f"  Filename template: {checkpoint_callback.filename}")
+    logging.info(f"  Monitor: {checkpoint_callback.monitor}")
+    logging.info(f"  Save top k: {checkpoint_callback.save_top_k}")
+    logging.info(f"  Save last: {checkpoint_callback.save_last}")
     
     # Early stopping callback if enabled
     if args.early_stopping:
@@ -133,6 +168,10 @@ def main(args):
         precision=forced_precision,
         strategy=args.strategy if args.strategy else 'auto',
         devices=get_lightning_devices(args.devices),
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        enable_checkpointing=True,
+        enable_model_summary=True,  
+        log_every_n_steps=10
     )
     
     # Train the model
@@ -143,6 +182,17 @@ def main(args):
     
     # Test the model
     trainer.test(model, data_module)
+    
+    # Get checkpoint path - try best first, then last if best not available
+    best_model_path = checkpoint_callback.best_model_path
+    if best_model_path:
+        logging.info(f"Best model saved to: {best_model_path}")
+        checkpoint_path = best_model_path
+    elif hasattr(checkpoint_callback, 'last_model_path') and checkpoint_callback.last_model_path:
+        last_model_path = checkpoint_callback.last_model_path
+        logging.info(f"Best model not found, using last model: {last_model_path}")
+        checkpoint_path = last_model_path
+  
 
 
 if __name__ == "__main__":
@@ -153,11 +203,11 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, default='/path/to/mimic/data', help='Path to MIMIC-IV data')
     parser.add_argument('--temp_dfs_path', type=str, default='temp_dfs_lite', help='Path to cache directory')
     parser.add_argument('--model_type', type=str, choices=['raindrop_v2'], default='raindrop_v2', help='Model type')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers')
+    parser.add_argument('--num_workers', type=int, default=12, help='Number of dataloader workers')
     
     # Model specific arguments
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
@@ -199,6 +249,11 @@ if __name__ == "__main__":
     # New argument for PHEcode loss
     parser.add_argument('--use_phecode_loss', type=lambda x: x.lower() in ['true', 't', 'yes', 'y', '1'], 
                         default=True, help='Enable PHEcode auxiliary loss (true/false)')
+    
+    
+    # Add lightning specific parameters
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=3,
+                        help='Run validation every n epochs')
     
     args = parser.parse_args()
     main(args)

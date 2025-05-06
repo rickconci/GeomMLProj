@@ -142,9 +142,10 @@ class MIMICContrastivePairsDatasetLite(Dataset):
                    torch.full((self.K,), self.P, dtype=torch.long), 0
 
         mort, readm = self._label_mm[row]
-        cur_pad = torch.from_numpy(self._cur_mat[row]).long()
+        # Create copies of the NumPy arrays before converting to tensors
+        cur_pad = torch.from_numpy(self._cur_mat[row].copy()).long()
         cur_len = int(self._cur_len[row])
-        nxt_pad = torch.from_numpy(self._nxt_mat[row]).long()
+        nxt_pad = torch.from_numpy(self._nxt_mat[row].copy()).long()
         nxt_len = int(self._nxt_len[row])
         return mort, readm, cur_pad, cur_len, nxt_pad, nxt_len
 
@@ -390,7 +391,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
         baseline_tensor = torch.tensor(meta.values[0], dtype=torch.float)
         return baseline_tensor
     
-    def split_by_subject_id(self, df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_state=42):
+    def split_by_subject_id(self, df, train_ratio=0.9, val_ratio=0.05, test_ratio=0.05, random_state=42):
         """
         Split hospital admissions into train/val/test sets based on subject_id.
         This ensures that all admissions for a given patient are in the same split.

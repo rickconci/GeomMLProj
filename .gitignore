@@ -10,3 +10,4 @@ wandb/
 copy_dir_lambda.sh
 lightning_logs/
 checkpoints/
+test_checkpoints/

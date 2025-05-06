@@ -58,10 +58,7 @@ def custom_collate_fn(batch):
 
     # 4) re-attach your lists of variable-length data
     collated['ds_embedding'] = ds_embeddings
-    
-    # 5) Add compatibility key for models expecting 'discharge_embeddings'
-    collated['discharge_embeddings'] = ds_embeddings
-        
+            
     return collated
 
     

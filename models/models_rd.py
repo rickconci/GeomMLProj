@@ -178,7 +178,7 @@ class Raindrop_v2(nn.Module):
             distance = 0
         elif step1 == True:
             adj = self.global_structure.to(device)
-            adj[torch.eye(self.d_inp).byte()] = 1
+            adj[torch.eye(self.d_inp).bool()] = 1
 
             edge_index = torch.nonzero(adj).T
             edge_weights = adj[edge_index[0], edge_index[1]]

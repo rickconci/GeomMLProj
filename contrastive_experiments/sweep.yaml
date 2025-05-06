@@ -1,0 +1,10 @@
+program: train_contrastive_lighting.py # the file above
+method: bayes # or "grid", "random", …
+metric:
+  name: val/loss # whatever you log with self.log(...)
+  goal: minimize
+parameters:
+  lr: { min: 1e-5, max: 1e-3, distribution: log_uniform }
+  batch_size: { values: [16, 32, 64] }
+  hidden_dim: { values: [128, 256, 512] }
+  temperature: { min: 0.05, max: 0.2 }

@@ -13,7 +13,7 @@ import dotenv
 import math
 from datetime import datetime
 import pytorch_lightning as pl
-from train_utils import seed_everything, get_device, calculate_phecode_loss, evaluate_downstream_tasks, calculate_binary_classification_metrics, calculate_phecode_metrics, prepare_phecode_targets
+from train_utils import seed_everything, get_device, calculate_phecode_loss, calculate_binary_classification_metrics, calculate_phecode_metrics, prepare_phecode_targets
 from contrastive_experiments.contrastive_utils import clip_contrastive_loss, infonce_loss, count_parameters, detailed_count_parameters
 from models.models_utils import ProjectionHead
 from models.main_models import DSEncoderWithWeightedSum
@@ -25,41 +25,35 @@ from lightning_fabric.utilities.apply_func import move_data_to_device
 class RaindropContrastiveModel(pl.LightningModule):
     """PyTorch Lightning module for Raindrop-based contrastive learning"""
     
-    def __init__(self, args, dims=None):
+    def __init__(self, args=None, dims=None):
         """Initialize the model with command line arguments"""
         super().__init__()
+        
+        # If args is None, it means we're loading from a checkpoint
+        # We'll restore it from hparams later
+        if args is None:
+            # Create a dummy args object with minimum required attributes
+            # Full values will be loaded from hparams
+            class DummyArgs:
+                def __init__(self):
+                    self.use_wandb = False
+                    self.seed = 42
+                    self.checkpoint_dir = "./checkpoints"
+                    self.sensor_wise_mask = True
+                    self.temperature = 0.07
+                    
+            args = DummyArgs()
+            
         self.args = args
         self.save_hyperparameters(vars(args))
-        
-        # Set random seeds for reproducibility
         seed_everything(args.seed)
-        
-        # Initialize WandB if enabled
         self.init_wandb()
-        
-        # Create paths for saving models and checkpoints
         os.makedirs(args.checkpoint_dir, exist_ok=True)
-        
-        # Track best metric
-        self.best_val_metric = 0
-        
-        # Variable embeddings will be set from the data module
-        self.var_embeddings = None
-        
-        # Store dimensions information
+                
         self.dims = dims
-        
-        # Initialize learnable temperature parameter
         self.log_temperature = nn.Parameter(torch.ones(1) * np.log(1.0 / args.temperature))
-        
-        # Flag to enable/disable PHEcode auxiliary loss
-        self.use_phecode_loss = getattr(args, 'use_phecode_loss', False)
-        logging.info(f"PHEcode auxiliary loss: {'enabled' if self.use_phecode_loss else 'disabled'}")
-        
-        # Store PHEcode dimensions
-        self.phe_code_size = None
-        if hasattr(args, 'phe_code_size'):
-            self.phe_code_size = args.phe_code_size
+        self.use_phecode_loss = getattr(args, 'use_phecode_loss', True)
+        self.phe_code_size = self.dims['phecode_size']
         
         # Initialize model components if dimensions are provided
         if dims is not None:
@@ -108,25 +102,8 @@ class RaindropContrastiveModel(pl.LightningModule):
         """Initialize Raindrop_v2 model with contrastive learning components"""
         logging.info("Initializing Raindrop_v2 model for contrastive learning")
         
-        # Load global structure for Raindrop if provided
-        global_structure = None
-        if self.args.global_structure_path:
-            if os.path.exists(self.args.global_structure_path):
-                try:
-                    global_structure = torch.load(self.args.global_structure_path)
-                    logging.info(f"Loaded global structure with shape {global_structure.shape}")
-                except Exception as e:
-                    logging.error(f"Error loading global structure: {e}")
-                    logging.info("Initializing with default fully-connected structure")
-                    global_structure = torch.ones(self.dims['variables_num'], self.dims['variables_num'])
-            else:
-                logging.warning(f"Global structure file {self.args.global_structure_path} not found")
-                logging.info("Initializing with default fully-connected structure")
-                global_structure = torch.ones(self.dims['variables_num'], self.dims['variables_num'])
-        else:
-            logging.info("Initializing with default fully-connected structure")
-            global_structure = torch.ones(self.dims['variables_num'], self.dims['variables_num'])
-        
+        # Global structure is fully connected
+        global_structure = torch.ones(self.dims['variables_num'], self.dims['variables_num'])
         # Create the base Raindrop_v2 model
         self.ts_model = Raindrop_v2(
             d_inp=self.dims['variables_num'], 
@@ -139,8 +116,8 @@ class RaindropContrastiveModel(pl.LightningModule):
             d_static=self.dims['d_static'],
             n_classes=1,  
             global_structure=global_structure,
-            sensor_wise_mask=self.args.sensor_wise_mask,
-            static=(self.dims['d_static'] > 0)
+            sensor_wise_mask=self.dims['sensor_wise_mask'],
+            static= self.dims['d_static']
         )
         
         # Create the discharge summary encoder
@@ -152,7 +129,6 @@ class RaindropContrastiveModel(pl.LightningModule):
         )
         
         # Create projection heads for contrastive learning
-        # For Raindrop, determine the output dimension based on the model configuration
         raindrop_output_dim = self.args.d_model + 16  # base model + positional encoding
         if self.args.sensor_wise_mask:
             raindrop_output_dim = self.dims['variables_num'] * (self.args.d_model // self.dims['variables_num'] + 16)
@@ -170,99 +146,72 @@ class RaindropContrastiveModel(pl.LightningModule):
             hidden_dim=self.args.hidden_dim,
             output_dim=self.args.projection_dim
         )
-        
-        # Create PHEcode predictor head only if enabled
+
         if self.use_phecode_loss:
             # Create PHEcode predictor using the projection dim as input
-            self.phecode_predictor = nn.Linear(self.args.projection_dim, self.phe_code_size)
+            self.current_phecode_predictor = nn.Sequential(
+                nn.Linear(self.args.projection_dim*2, self.phe_code_size))
             logging.info(f"Created PHEcode predictor head with output size: {self.phe_code_size}")
         else:
             # Set a dummy component that returns None when called
             self.phecode_predictor = lambda x: None
             logging.info("PHEcode predictor not created (auxiliary loss disabled)")
+
+        # Downstream heads take the concat of ts and text projections
+        self.next_phecode_predictor = nn.Sequential(
+            nn.Linear(self.args.projection_dim*2, self.args.projection_dim),
+            nn.ReLU(),
+            nn.Linear(self.args.projection_dim, self.phe_code_size)
+        )
+        
+        self.mortality_classifier = nn.Sequential(
+            nn.Linear(self.args.projection_dim*2, self.args.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.args.hidden_dim, 1)  # Binary classification
+        )
+
+        self.readmission_classifier = nn.Sequential(
+            nn.Linear(self.args.projection_dim*2, self.args.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.args.hidden_dim, 1)  # Binary classification
+        )
+
     
     def prepare_batch(self, batch):
         """Prepare a batch for training or evaluation"""
         # Skip empty batches
         if not batch:
             return None
-            
-        # Move data to device and ensure float32 precision for MPS compatibility
-        values = batch['values'].to(self.device, dtype=torch.float32)
-        mask = batch['mask'].to(self.device, dtype=torch.float32)
-        
-        # Handle static features (may be empty)
-        static = None
-        if 'static' in batch and batch['static'].numel() > 0:
-            static = batch['static'].to(self.device, dtype=torch.float32)
-        
-        # Handle time information
-        times = batch['times'].to(self.device, dtype=torch.float32)
-        length = batch['length'].to(self.device)
-        
-        # Get discharge embeddings
-        discharge_embeddings = None
-        if 'discharge_embeddings' in batch:
-            discharge_embeddings = batch['discharge_embeddings']
-            if torch.is_tensor(discharge_embeddings):
-                discharge_embeddings = discharge_embeddings.to(self.device, dtype=torch.float32)
-        elif 'ds_embedding' in batch:
-            discharge_embeddings = batch['ds_embedding']
-            if torch.is_tensor(discharge_embeddings):
-                discharge_embeddings = discharge_embeddings.to(self.device, dtype=torch.float32)
-        
-        # Combine values and mask for model input
-        P = torch.cat([values, mask], dim=2)
-        
-        # Prepare time dimensions
-        if len(times.shape) == 2:  # Shape [B, T]
-            P_time = times
-        else:  # Just a single dimension [T]
-            P_time = times.unsqueeze(0).repeat(values.size(0), 1)  # Shape [B, T]
-        
-        # Create P_avg_interval with the same shape as P_time
-        P_avg_interval = torch.ones_like(P_time)  # Shape [B, T]
-        
-        # Expand P_avg_interval to match the number of variables
-        if hasattr(self, 'dims') and self.dims is not None and 'variables_num' in self.dims:
-            vars_num = self.dims['variables_num']
-        else:
-            vars_num = values.size(2) // 2  # Assuming half is values, half is mask
-            
-        P_avg_interval = P_avg_interval.unsqueeze(2).expand(-1, -1, vars_num)  # Shape [B, T, N]
-        
-        # Prepare length tensor
-        P_length = length.unsqueeze(1) if length.dim() == 1 else length  # Shape [B, 1]
-        
+        values = batch['values'].to(self.device, dtype=torch.float32)  # [B, T, F]
+        mask = batch['mask'].to(self.device, dtype=torch.float32)  # [B, T, F]
+        P = torch.cat([values, mask], dim=2).permute(1, 0, 2) # [T, B, F]
+        length = batch['length'].to(self.device).unsqueeze(1) # [B, 1]
+        ds_embeddings = [emb.to(self.device, dtype=torch.float32) for emb in batch['ds_embedding']]
+
         return {
             'P': P,
-            'P_static': static,
-            'P_avg_interval': P_avg_interval,
-            'P_length': P_length,
-            'P_time': P_time,
-            'discharge_embeddings': discharge_embeddings
+            'P_static': batch['static'].to(self.device, dtype=torch.float32),
+            'P_length': length,
+            'P_time': batch['times'].to(self.device, dtype=torch.float32),
+            'discharge_embeddings': ds_embeddings,
+            'current_idx_padded': batch['current_idx_padded'].to(self.device),
+            'current_phecode_len': batch['current_len'].to(self.device),
+            'next_idx_padded': batch['next_idx_padded'].to(self.device),
+            'next_phecode_len': batch['next_len'].to(self.device),
+            'mortality_label': batch['mortality_label'].to(self.device, dtype=torch.float32),
+            'readmission_label': batch['readmission_label'].to(self.device, dtype=torch.float32)
         }
+    
+
     
     def model_forward(self, batch_data):
         """Forward pass for Raindrop contrastive model"""
-        if self.ts_model is None:
-            # If model hasn't been initialized yet and we have dimensions, do it now
-            if self.dims is not None:
-                self.init_model()
-            
-            # If still not initialized, something is wrong
-            if self.ts_model is None:
-                raise RuntimeError("Model components not initialized. Dimensions must be provided during initialization or before forward pass.")
-
-        # Prepare input for Raindrop_v2
-        # Raindrop expects: src [max_len, batch_size, 2*d_inp]
-        src = batch_data['P'].permute(1, 0, 2)  # [T, B, F]
-        static = batch_data['P_static']  # [B, S]
-        times = batch_data['P_time'].permute(1, 0)  # [T, B]
-        lengths = batch_data['P_length'].squeeze(1)  # [B]
-        
+    
         # Process time series data with Raindrop_v2
-        ts_output, _, _ = self.ts_model(src, static, times, lengths)
+        ts_output, _, _ = self.ts_model(batch_data['P'], 
+                                        batch_data['P_static'], 
+                                        batch_data['P_time'].permute(1, 0),  
+                                        batch_data['P_length'].squeeze(1))
         
         # Process discharge summary text
         text_embeddings = self.ds_encoder(batch_data['discharge_embeddings'])
@@ -274,8 +223,9 @@ class RaindropContrastiveModel(pl.LightningModule):
         # Generate PHEcode predictions only if the auxiliary loss is enabled
         if self.use_phecode_loss:
             # We'll use the average of time series and text projections for prediction
-            fused_proj = (ts_proj + text_proj) / 2
-            phecode_logits = self.phecode_predictor(fused_proj)
+            #fused_proj = (ts_proj + text_proj) / 2
+            concat_proj = torch.cat([ts_proj, text_proj], dim=1)
+            phecode_logits = self.current_phecode_predictor(concat_proj)
         else:
             phecode_logits = None
         
@@ -301,18 +251,18 @@ class RaindropContrastiveModel(pl.LightningModule):
         
         return loss
     
-    def phecode_prediction_loss(self, phecode_logits, batch_data):
+    def current_phecode_prediction_loss(self, phecode_logits, batch_data):
         """Calculate PHEcode prediction loss"""
         # Extract current PHEcodes (not next PHEcodes)
-        idxs = batch_data.get('current_idx_padded', batch_data.get('next_idx_padded'))
-        lens = batch_data.get('current_len', batch_data.get('next_len'))
+        current_idxs = batch_data.get('current_idx_padded')
+        current_lens = batch_data.get('current_phecode_len')
         
         # Skip if we don't have PHEcode data
-        if idxs is None or lens is None:
+        if current_idxs is None or current_lens is None:
             return torch.tensor(0.0, device=self.device)
             
         # Calculate the PHEcode loss using the utility function
-        return calculate_phecode_loss(phecode_logits, idxs, lens, self.device)
+        return calculate_phecode_loss(phecode_logits, current_idxs, current_lens, self.device)
     
     def training_step(self, batch, batch_idx):
         """PyTorch Lightning training step"""
@@ -321,22 +271,16 @@ class RaindropContrastiveModel(pl.LightningModule):
         if batch_data is None:
             return None
         
-        # Forward pass through model
         ts_proj, text_proj, phecode_logits = self.model_forward(batch_data)
-        
-        # Calculate contrastive loss with learnable temperature
         contrastive_loss = self.contrastive_loss_with_learnable_temp(ts_proj, text_proj)
-        
-        # Log contrastive loss
         self.log('train_contrastive_loss', contrastive_loss, on_step=True, on_epoch=True, prog_bar=True)
         
-        # Initialize total_loss with contrastive_loss
         total_loss = contrastive_loss
         
         # Add PHEcode prediction loss if enabled
         if self.use_phecode_loss and phecode_logits is not None:
-            phecode_loss = self.phecode_prediction_loss(phecode_logits, batch_data)
-            phecode_weight = getattr(self.args, 'phecode_loss_weight', 0.2)
+            phecode_loss = self.current_phecode_prediction_loss(phecode_logits, batch_data)
+            phecode_weight = getattr(self.args, 'phecode_loss_weight', 0.01)
             total_loss = total_loss + phecode_weight * phecode_loss
             self.log('train_phecode_loss', phecode_loss, on_step=True, on_epoch=True, prog_bar=True)
         
@@ -364,16 +308,45 @@ class RaindropContrastiveModel(pl.LightningModule):
         }
         
         # Add labels for downstream tasks if available
-        for key in ['mortality_label', 'readmission_label', 'next_idx_padded', 'next_len']:
+        for key in ['mortality_label', 'readmission_label', 'next_idx_padded', 'next_phecode_len']:
             if key in batch:
                 result[key] = batch[key]
         
+        # Important: log outputs for on_validation_epoch_end
+        self.validation_step_outputs.append(result)
+        
         return result
     
-    def validation_epoch_end(self, outputs):
-        """Evaluate downstream tasks at the end of validation epoch"""
+    def on_validation_epoch_start(self):
+        """Initialize list to store validation step outputs and reset downstream heads"""
+        self.validation_step_outputs = []
+        
+        # Reset weights of downstream prediction heads
+        self._reset_classifier_weights(self.mortality_classifier)
+        self._reset_classifier_weights(self.readmission_classifier)
+        self._reset_classifier_weights(self.next_phecode_predictor)
+        
+        logging.info("Reset weights of downstream prediction heads for validation")
+    
+    def _reset_classifier_weights(self, model):
+        """Reset the weights of a model to their initial values"""
+        for layer in model.modules():
+            if isinstance(layer, nn.Linear):
+                # Reset weights using Xavier/Glorot initialization
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+    
+    def on_validation_epoch_end(self):
+        """Train and evaluate downstream tasks at the end of validation epoch"""
+        outputs = self.validation_step_outputs
+        
         if not outputs:
             return
+        
+        # Get current epoch number for logging
+        current_epoch = self.trainer.current_epoch
+        logging.info(f"Running validation tasks for epoch {current_epoch}")
         
         # Collect embeddings and labels
         all_ts_projs = []
@@ -412,105 +385,304 @@ class RaindropContrastiveModel(pl.LightningModule):
         
         # Fused embeddings (average of ts and text)
         fused_projs = (ts_projs + text_projs) / 2
+        concat_projs = torch.cat([ts_projs, text_projs], dim=1)
+
+        # Create a metrics dictionary to collect all results
+        all_metrics = {'epoch': current_epoch}
         
-        # Evaluate downstream tasks
-        self._evaluate_downstream_mortality(fused_projs, all_mortality_labels)
-        self._evaluate_downstream_readmission(fused_projs, all_readmission_labels)
-        self._evaluate_downstream_phecodes(fused_projs, all_next_idx_padded, all_next_lens)
+        # Train and evaluate downstream tasks
+        mortality_metrics = self._train_and_evaluate_mortality(concat_projs, all_mortality_labels)
+        readmission_metrics = self._train_and_evaluate_readmission(concat_projs, all_readmission_labels)
+        phecode_metrics = self._train_and_evaluate_phecodes(concat_projs, all_next_idx_padded, all_next_lens)
+        
+        # Update metrics dictionary with task-specific results
+        if mortality_metrics:
+            all_metrics.update({f'mortality_{k}': v for k, v in mortality_metrics.items()})
+        if readmission_metrics:
+            all_metrics.update({f'readmission_{k}': v for k, v in readmission_metrics.items()})
+        if phecode_metrics:
+            all_metrics.update({f'phecode_{k}': v for k, v in phecode_metrics.items()})
+        
+        # Log all metrics to wandb if available
+        if self.args.use_wandb and hasattr(self, 'run') and self.run is not None:
+            try:
+                # Create a metrics dict specifically for wandb with clearer naming
+                wandb_metrics = {
+                    'epoch': current_epoch,
+                    'val_downstream/mortality_auroc': all_metrics.get('mortality_auroc', 0.0),
+                    'val_downstream/mortality_auprc': all_metrics.get('mortality_auprc', 0.0),
+                    'val_downstream/readmission_auroc': all_metrics.get('readmission_auroc', 0.0),
+                    'val_downstream/readmission_auprc': all_metrics.get('readmission_auprc', 0.0),
+                    'val_downstream/phecode_micro_auc': all_metrics.get('phecode_micro_auc', 0.0),
+                    'val_downstream/phecode_macro_auc': all_metrics.get('phecode_macro_auc', 0.0),
+                    'val_downstream/phecode_micro_ap': all_metrics.get('phecode_micro_ap', 0.0),
+                    'val_downstream/phecode_prec@5': all_metrics.get('phecode_prec@5', 0.0),
+                }
+                
+                # Log to wandb with the current epoch
+                wandb.log(wandb_metrics, step=current_epoch)
+                logging.info(f"Logged validation metrics to wandb for epoch {current_epoch}")
+            except Exception as e:
+                logging.warning(f"Failed to log metrics to wandb: {str(e)}")
     
-    def _evaluate_downstream_mortality(self, embeddings, mortality_labels):
-        """Evaluate mortality prediction task"""
+    def _train_classifier(self, classifier, embeddings, targets, is_multilabel=False, valid_samples=None):
+        """
+        Generic training method for downstream classifiers
+        
+        Args:
+            classifier: The classifier model to train
+            embeddings: Embeddings to use for training
+            targets: Target labels
+            is_multilabel: Whether this is a multi-label classification task
+            valid_samples: Optional tensor of indices for valid samples (for PHE codes)
+        
+        Returns:
+            Predictions and targets for metrics calculation
+        """
+
+        torch.set_grad_enabled(True)
+        
+        # Get valid embeddings and targets if needed
+        if valid_samples is not None:
+            valid_embeddings = embeddings[valid_samples]
+            if is_multilabel:
+                # For PHE codes, targets are already prepared
+                valid_targets = targets
+            else:
+                # For binary tasks, need to select valid targets
+                valid_targets = targets[valid_samples]
+        else:
+            valid_embeddings = embeddings
+            valid_targets = targets
+            
+        # Ensure embeddings have requires_grad=True for training
+        # Key fix: we need a fresh tensor not connected to the original computation graph
+        valid_embeddings = torch.nn.Parameter(valid_embeddings.clone().detach(), requires_grad=True)
+            
+        # Setup optimizer
+        # Only optimize the classifier parameters, not the embeddings
+        optimizer = torch.optim.Adam([
+            {'params': classifier.parameters()}
+        ], lr=0.001)
+        
+        # Define loss function
+        criterion = torch.nn.BCEWithLogitsLoss()
+        
+        # Train the classifier on the embeddings
+        num_epochs = 3
+        batch_size = 256
+        n_samples = valid_embeddings.size(0)
+        
+        classifier.train()
+        for epoch in range(num_epochs):
+            # Shuffle indices
+            indices = torch.randperm(n_samples, device=self.device)
+            total_loss = 0.0
+            
+            # Train in batches
+            for i in range(0, n_samples, batch_size):
+                end_idx = min(i + batch_size, n_samples)
+                if i >= end_idx:
+                    continue
+                    
+                idx = indices[i:end_idx]
+                batch_embeddings = valid_embeddings[idx]
+                batch_targets = valid_targets[idx]
+                
+                # Forward pass
+                logits = classifier(batch_embeddings)
+                
+                # Apply squeeze for binary classification tasks
+                if not is_multilabel:
+                    logits = logits.squeeze(-1)
+                    
+                loss = criterion(logits, batch_targets)
+                
+                # Backward pass and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+            
+            # Log training progress every few epochs
+            if epoch % 5 == 0 or epoch == num_epochs - 1:
+                avg_loss = total_loss / max(1, (n_samples // batch_size))
+                logging.info(f"Validation classifier training - Epoch {epoch}, Loss: {avg_loss:.4f}")
+        
+        # Evaluate the trained classifier
+        classifier.eval()
+        with torch.no_grad():
+            logits = classifier(valid_embeddings)
+            preds = torch.sigmoid(logits)
+            
+            # Return predictions and targets for metrics calculation
+            return preds, valid_targets
+    
+    def _train_and_evaluate_mortality(self, embeddings, mortality_labels):
+        """Train and evaluate mortality prediction task"""
         if not mortality_labels:
-            return
+            return None
         
         # Concatenate labels
         labels = torch.cat(mortality_labels, dim=0)
         
         # Skip if no positive samples
         if labels.sum() == 0:
-            return
-            
-        # Create a simple linear classifier for mortality prediction
-        classifier = torch.nn.Linear(embeddings.shape[1], 1).to(self.device)
+            return None
         
-        # Make predictions
-        with torch.no_grad():
-            logits = classifier(embeddings)
-            preds = torch.sigmoid(logits).squeeze(-1)
-            
-            # Calculate AUROC and AUPRC
-            metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), labels.cpu().numpy())
-            
-            # Log metrics
-            self.log('val_mortality_auroc', metrics['auroc'], on_epoch=True)
-            self.log('val_mortality_auprc', metrics['auprc'], on_epoch=True)
+        # Use the existing mortality classifier
+        classifier = self.mortality_classifier
+        
+        # Train classifier and get predictions
+        preds, targets = self._train_classifier(
+            classifier=classifier,
+            embeddings=embeddings,
+            targets=labels,
+            is_multilabel=False
+        )
+        
+        # Ensure predictions are flattened for binary tasks
+        preds = preds.squeeze(-1)
+        
+        # Use the utility function from train_utils to calculate metrics
+        metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), targets.cpu().numpy())
+        
+        # Log metrics
+        self.log('val_mortality_auroc', metrics['auroc'], on_epoch=True)
+        self.log('val_mortality_auprc', metrics['auprc'], on_epoch=True)
+        
+        logging.info(f"Mortality classifier performance - AUROC: {metrics['auroc']:.4f}, AUPRC: {metrics['auprc']:.4f}")
+        
+        # Return metrics for wandb logging
+        return metrics
     
-    def _evaluate_downstream_readmission(self, embeddings, readmission_labels):
-        """Evaluate readmission prediction task"""
+    def _train_and_evaluate_readmission(self, embeddings, readmission_labels):
+        """Train and evaluate readmission prediction task"""
         if not readmission_labels:
-            return
+            return None
         
         # Concatenate labels
         labels = torch.cat(readmission_labels, dim=0)
         
         # Skip if no positive samples
         if labels.sum() == 0:
-            return
-            
-        # Create a simple linear classifier for readmission prediction
-        classifier = torch.nn.Linear(embeddings.shape[1], 1).to(self.device)
+            return None
         
-        # Make predictions
-        with torch.no_grad():
-            logits = classifier(embeddings)
-            preds = torch.sigmoid(logits).squeeze(-1)
-            
-            # Calculate AUROC and AUPRC
-            metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), labels.cpu().numpy())
-            
-            # Log metrics
-            self.log('val_readmission_auroc', metrics['auroc'], on_epoch=True)
-            self.log('val_readmission_auprc', metrics['auprc'], on_epoch=True)
+        # Use the existing readmission classifier
+        classifier = self.readmission_classifier
+        
+        # Train classifier and get predictions
+        preds, targets = self._train_classifier(
+            classifier=classifier,
+            embeddings=embeddings,
+            targets=labels,
+            is_multilabel=False
+        )
+        
+        # Ensure predictions are flattened for binary tasks
+        preds = preds.squeeze(-1)
+        
+        # Use the utility function from train_utils to calculate metrics
+        metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), targets.cpu().numpy())
+        
+        # Log metrics
+        self.log('val_readmission_auroc', metrics['auroc'], on_epoch=True)
+        self.log('val_readmission_auprc', metrics['auprc'], on_epoch=True)
+        
+        logging.info(f"Readmission classifier performance - AUROC: {metrics['auroc']:.4f}, AUPRC: {metrics['auprc']:.4f}")
+        
+        # Return metrics for wandb logging
+        return metrics
     
-    def _evaluate_downstream_phecodes(self, embeddings, next_idx_padded, next_lens):
-        """Evaluate PHEcode prediction task"""
+    def _train_and_evaluate_phecodes(self, embeddings, next_idx_padded, next_lens):
+        """Train and evaluate PHEcode prediction task"""
         if not next_idx_padded or not next_lens or not self.phe_code_size:
-            return
+            logging.info(f"Skipping PHEcode evaluation - missing data or phe_code_size")
+            return None
             
         try:
             # Concatenate indices and lengths
             indices = torch.cat(next_idx_padded, dim=0)
             lengths = torch.cat(next_lens, dim=0)
             
-            # Prepare PHEcode targets
-            targets, valid_samples = prepare_phecode_targets(
-                {'next_idx_padded': indices, 'next_len': lengths}, 
-                self.device, 
-                self.phe_code_size
-            )
+            # Log key information about the indices
+            max_idx = indices.max().item() if indices.numel() > 0 else 0
+            min_idx = indices.min().item() if indices.numel() > 0 else 0
+            logging.info(f"PHEcode indices range: min={min_idx}, max={max_idx}, phe_code_size={self.phe_code_size}")
+            
+            # Check for out-of-bounds indices
+            if max_idx >= self.phe_code_size:
+                logging.warning(f"PHEcode indices out of bounds: max index {max_idx} >= phecode size {self.phe_code_size}")
+                logging.warning(f"Consider increasing phe_code_size to at least {max_idx + 1}")
+                return None
+            
+            # Check if there are valid codes
+            if lengths.sum() == 0:
+                logging.info("No PHEcode targets available for evaluation")
+                return None
+            
+            # Use the prepare_phecode_targets function from train_utils
+            try:
+                targets, valid_samples = prepare_phecode_targets(
+                    {'next_idx_padded': indices, 'next_len': lengths}, 
+                    self.device, 
+                    self.phe_code_size
+                )
+            except Exception as e:
+                logging.error(f"Error preparing PHEcode targets: {e}")
+                return None
             
             if targets is None or targets.shape[0] == 0:
-                return
+                logging.info("No valid PHEcode targets generated")
+                return None
                 
-            # Get valid embeddings
-            valid_embeddings = embeddings[valid_samples] if valid_samples is not None else embeddings
+            # Check that valid_samples indices are in bounds
+            if valid_samples is not None and valid_samples.max().item() >= embeddings.shape[0]:
+                logging.warning(f"Valid samples indices out of bounds: max index {valid_samples.max().item()} >= embeddings shape {embeddings.shape[0]}")
+                return None
+                
+            # Verify dimensions
+            logging.info(f"Embeddings shape: {embeddings.shape}, PHEcode size: {self.phe_code_size}")
             
-            # Create a simple linear classifier for PHEcode prediction
-            classifier = torch.nn.Linear(valid_embeddings.shape[1], self.phe_code_size).to(self.device)
+            # Use the existing next_phecode_predictor
+            classifier = self.next_phecode_predictor
             
-            # Make predictions
-            with torch.no_grad():
-                logits = classifier(valid_embeddings)
-                preds = torch.sigmoid(logits)
-                
-                # Calculate metrics
-                phecode_metrics = calculate_phecode_metrics(preds.cpu().numpy(), targets.cpu().numpy())
-                
-                # Log metrics
-                self.log('val_phecode_micro_auc', phecode_metrics.get('micro_auc', 0.0), on_epoch=True)
-                self.log('val_phecode_prec@5', phecode_metrics.get('prec@5', 0.0), on_epoch=True)
+            # Train classifier and get predictions
+            preds, targets = self._train_classifier(
+                classifier=classifier,
+                embeddings=embeddings,
+                targets=targets,
+                is_multilabel=True,
+                valid_samples=valid_samples
+            )
+            
+            # Use the utility function from train_utils to calculate metrics
+            phecode_metrics = calculate_phecode_metrics(preds.cpu().numpy(), targets.cpu().numpy())
+            
+            # Log metrics
+            self.log('val_phecode_micro_auc', phecode_metrics.get('micro_auc', 0.0), on_epoch=True)
+            self.log('val_phecode_macro_auc', phecode_metrics.get('macro_auc', 0.0), on_epoch=True)
+            self.log('val_phecode_micro_ap', phecode_metrics.get('micro_ap', 0.0), on_epoch=True)
+            self.log('val_phecode_prec@5', phecode_metrics.get('prec@5', 0.0), on_epoch=True)
+            
+            # Log detailed metrics
+            logging.info(f"PHEcode classifier performance:")
+            logging.info(f"  - Micro AUC: {phecode_metrics.get('micro_auc', 0.0):.4f}")
+            logging.info(f"  - Macro AUC: {phecode_metrics.get('macro_auc', 0.0):.4f}")
+            logging.info(f"  - Micro AP: {phecode_metrics.get('micro_ap', 0.0):.4f}")
+            logging.info(f"  - Precision@5: {phecode_metrics.get('prec@5', 0.0):.4f}")
+            
+            # Return metrics for wandb logging
+            return phecode_metrics
+            
         except Exception as e:
-            print(f"Error in PHEcode evaluation: {e}")
+            logging.error(f"Error in PHEcode evaluation: {e}")
+            # Add detailed traceback for debugging
+            import traceback
+            logging.error(f"Traceback: {traceback.format_exc()}")
+            # Don't rethrow the exception - just log and continue
+            return None
     
     def test_step(self, batch, batch_idx):
         """PyTorch Lightning test step - skipped as we use separate downstream evaluation"""
@@ -523,10 +695,10 @@ class RaindropContrastiveModel(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         
         # Get total number of training steps
-        total_steps = self.trainer.estimated_stepping_batches
+        total_steps = max(1, self.trainer.estimated_stepping_batches)
         
-        # Number of warmup steps (typically 10% of total steps)
-        warmup_steps = int(0.1 * total_steps)
+        # Number of warmup steps (typically 10% of total steps), minimum 1
+        warmup_steps = max(1, int(0.1 * total_steps))
         
         # Create a cosine annealing scheduler with warmup
         # Using math.cos instead of torch.cos since step is a Python float
@@ -557,47 +729,19 @@ class RaindropContrastiveModel(pl.LightningModule):
         # Move batch to device as usual
         return move_data_to_device(batch, device)
 
-
-
-
-
-
-def get_model(args, data_module):
-    """Get model based on args.model_type"""
-    try:
-        # Get dimensions from data module
-        dims = get_model_dimensions(data_module)
-        
-        # Get variable embeddings
-        var_embeddings = data_module.get_var_embeddings()
-        
-        # Set PHEcode size in args if the auxiliary loss is enabled
-        if getattr(args, 'use_phecode_loss', False):
-            # Get phecode_size directly from the dataset
-            args.phe_code_size = data_module.dataset.phecode_size
-            logging.info(f"Setting PHEcode size from dataset: {args.phe_code_size}")
+    def on_load_checkpoint(self, checkpoint):
+        """Called when loading a checkpoint - restore args from hyperparameters"""
+        # Create a namespace object from the hyperparameters dictionary
+        if hasattr(self, 'hparams'):
+            # Convert hparams dict to an object with attributes
+            class ArgsFromCheckpoint:
+                def __init__(self, hparams_dict):
+                    for key, value in hparams_dict.items():
+                        setattr(self, key, value)
             
-            # Set default phecode loss weight if not set
-            if not hasattr(args, 'phecode_loss_weight'):
-                args.phecode_loss_weight = 0.2
-                logging.info(f"Using default PHEcode loss weight: {args.phecode_loss_weight}")
-        else:
-            logging.info("PHEcode auxiliary loss is disabled")
-        
-        # Initialize model with dimensions
-        model = RaindropContrastiveModel(args, dims=dims)
-        
-        # Set variable embeddings
-        model.var_embeddings = var_embeddings
-        
-        # Log parameter count
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logging.info(f"Model initialized with {trainable_params:,} trainable parameters out of {total_params:,} total parameters")
-        
-        return model
-    except Exception as e:
-        logging.error(f"Error initializing model: {e}")
-        # Create model anyway - default dimensions will be used
-        model = RaindropContrastiveModel(args)
-        return model
+            # Create args object from hyperparameters
+            restored_args = ArgsFromCheckpoint(dict(self.hparams))
+            self.args = restored_args
+
+
+
