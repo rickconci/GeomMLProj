@@ -9,9 +9,13 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
+nltk.download('punkt_tab')
+
 
 # Get the current working directory where the script is being run from
 WORKING_DIR = os.getcwd()
+
+
 
 # Set device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")

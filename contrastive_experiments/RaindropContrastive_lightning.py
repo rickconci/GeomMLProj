@@ -10,9 +10,10 @@ from pathlib import Path
 import time
 import logging
 import dotenv
+import math
 from datetime import datetime
 import pytorch_lightning as pl
-from train_utils import seed_everything, get_device, calculate_phecode_loss, evaluate_downstream_tasks
+from train_utils import seed_everything, get_device, calculate_phecode_loss, evaluate_downstream_tasks, calculate_binary_classification_metrics, calculate_phecode_metrics, prepare_phecode_targets
 from contrastive_experiments.contrastive_utils import clip_contrastive_loss, infonce_loss, count_parameters, detailed_count_parameters
 from models.models_utils import ProjectionHead
 from models.main_models import DSEncoderWithWeightedSum
@@ -345,71 +346,201 @@ class RaindropContrastiveModel(pl.LightningModule):
         return total_loss
     
     def validation_step(self, batch, batch_idx):
-        """PyTorch Lightning validation step"""
+        """PyTorch Lightning validation step - collect embeddings for downstream evaluation"""
         # Prepare batch data
         batch_data = self.prepare_batch(batch)
         if batch_data is None:
             return None
         
-        # Forward pass through model
-        ts_proj, text_proj, phecode_logits = self.model_forward(batch_data)
+        # Forward pass through model to get embeddings
+        with torch.no_grad():
+            ts_proj, text_proj, _ = self.model_forward(batch_data)
         
-        # Calculate contrastive loss with learnable temperature
-        contrastive_loss = self.contrastive_loss_with_learnable_temp(ts_proj, text_proj)
+        # No need to compute contrastive loss during validation
+        # Just collect embeddings and labels for downstream evaluation
+        result = {
+            'ts_proj': ts_proj.detach(),
+            'text_proj': text_proj.detach()
+        }
         
-        # Log contrastive loss
-        self.log('val_contrastive_loss', contrastive_loss, on_step=False, on_epoch=True, prog_bar=True)
+        # Add labels for downstream tasks if available
+        for key in ['mortality_label', 'readmission_label', 'next_idx_padded', 'next_len']:
+            if key in batch:
+                result[key] = batch[key]
         
-        # Initialize total_loss with contrastive_loss
-        total_loss = contrastive_loss
+        return result
+    
+    def validation_epoch_end(self, outputs):
+        """Evaluate downstream tasks at the end of validation epoch"""
+        if not outputs:
+            return
         
-        # Add PHEcode prediction loss if enabled
-        if self.use_phecode_loss and phecode_logits is not None:
-            phecode_loss = self.phecode_prediction_loss(phecode_logits, batch_data)
-            phecode_weight = getattr(self.args, 'phecode_loss_weight', 0.2)
-            total_loss = total_loss + phecode_weight * phecode_loss
-            self.log('val_phecode_loss', phecode_loss, on_step=False, on_epoch=True)
+        # Collect embeddings and labels
+        all_ts_projs = []
+        all_text_projs = []
+        all_mortality_labels = []
+        all_readmission_labels = []
+        all_next_idx_padded = []
+        all_next_lens = []
         
-        # Log total loss
-        self.log('val_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True)
+        for output in outputs:
+            if output is None:
+                continue
+                
+            if 'ts_proj' in output:
+                all_ts_projs.append(output['ts_proj'])
+            if 'text_proj' in output:
+                all_text_projs.append(output['text_proj'])
+            
+            # Collect labels
+            if 'mortality_label' in output:
+                all_mortality_labels.append(output['mortality_label'])
+            if 'readmission_label' in output:
+                all_readmission_labels.append(output['readmission_label'])
+            if 'next_idx_padded' in output:
+                all_next_idx_padded.append(output['next_idx_padded'])
+            if 'next_len' in output:
+                all_next_lens.append(output['next_len'])
         
-        return total_loss
+        # Skip if we don't have any embeddings
+        if not all_ts_projs or not all_text_projs:
+            return
+            
+        # Concatenate embeddings from all batches
+        ts_projs = torch.cat(all_ts_projs, dim=0)
+        text_projs = torch.cat(all_text_projs, dim=0)
+        
+        # Fused embeddings (average of ts and text)
+        fused_projs = (ts_projs + text_projs) / 2
+        
+        # Evaluate downstream tasks
+        self._evaluate_downstream_mortality(fused_projs, all_mortality_labels)
+        self._evaluate_downstream_readmission(fused_projs, all_readmission_labels)
+        self._evaluate_downstream_phecodes(fused_projs, all_next_idx_padded, all_next_lens)
+    
+    def _evaluate_downstream_mortality(self, embeddings, mortality_labels):
+        """Evaluate mortality prediction task"""
+        if not mortality_labels:
+            return
+        
+        # Concatenate labels
+        labels = torch.cat(mortality_labels, dim=0)
+        
+        # Skip if no positive samples
+        if labels.sum() == 0:
+            return
+            
+        # Create a simple linear classifier for mortality prediction
+        classifier = torch.nn.Linear(embeddings.shape[1], 1).to(self.device)
+        
+        # Make predictions
+        with torch.no_grad():
+            logits = classifier(embeddings)
+            preds = torch.sigmoid(logits).squeeze(-1)
+            
+            # Calculate AUROC and AUPRC
+            metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), labels.cpu().numpy())
+            
+            # Log metrics
+            self.log('val_mortality_auroc', metrics['auroc'], on_epoch=True)
+            self.log('val_mortality_auprc', metrics['auprc'], on_epoch=True)
+    
+    def _evaluate_downstream_readmission(self, embeddings, readmission_labels):
+        """Evaluate readmission prediction task"""
+        if not readmission_labels:
+            return
+        
+        # Concatenate labels
+        labels = torch.cat(readmission_labels, dim=0)
+        
+        # Skip if no positive samples
+        if labels.sum() == 0:
+            return
+            
+        # Create a simple linear classifier for readmission prediction
+        classifier = torch.nn.Linear(embeddings.shape[1], 1).to(self.device)
+        
+        # Make predictions
+        with torch.no_grad():
+            logits = classifier(embeddings)
+            preds = torch.sigmoid(logits).squeeze(-1)
+            
+            # Calculate AUROC and AUPRC
+            metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), labels.cpu().numpy())
+            
+            # Log metrics
+            self.log('val_readmission_auroc', metrics['auroc'], on_epoch=True)
+            self.log('val_readmission_auprc', metrics['auprc'], on_epoch=True)
+    
+    def _evaluate_downstream_phecodes(self, embeddings, next_idx_padded, next_lens):
+        """Evaluate PHEcode prediction task"""
+        if not next_idx_padded or not next_lens or not self.phe_code_size:
+            return
+            
+        try:
+            # Concatenate indices and lengths
+            indices = torch.cat(next_idx_padded, dim=0)
+            lengths = torch.cat(next_lens, dim=0)
+            
+            # Prepare PHEcode targets
+            targets, valid_samples = prepare_phecode_targets(
+                {'next_idx_padded': indices, 'next_len': lengths}, 
+                self.device, 
+                self.phe_code_size
+            )
+            
+            if targets is None or targets.shape[0] == 0:
+                return
+                
+            # Get valid embeddings
+            valid_embeddings = embeddings[valid_samples] if valid_samples is not None else embeddings
+            
+            # Create a simple linear classifier for PHEcode prediction
+            classifier = torch.nn.Linear(valid_embeddings.shape[1], self.phe_code_size).to(self.device)
+            
+            # Make predictions
+            with torch.no_grad():
+                logits = classifier(valid_embeddings)
+                preds = torch.sigmoid(logits)
+                
+                # Calculate metrics
+                phecode_metrics = calculate_phecode_metrics(preds.cpu().numpy(), targets.cpu().numpy())
+                
+                # Log metrics
+                self.log('val_phecode_micro_auc', phecode_metrics.get('micro_auc', 0.0), on_epoch=True)
+                self.log('val_phecode_prec@5', phecode_metrics.get('prec@5', 0.0), on_epoch=True)
+        except Exception as e:
+            print(f"Error in PHEcode evaluation: {e}")
     
     def test_step(self, batch, batch_idx):
-        """PyTorch Lightning test step"""
-        # Prepare batch data
-        batch_data = self.prepare_batch(batch)
-        if batch_data is None:
-            return None
-        
-        # Forward pass through model
-        ts_proj, text_proj, phecode_logits = self.model_forward(batch_data)
-        
-        # Calculate contrastive loss with learnable temperature
-        contrastive_loss = self.contrastive_loss_with_learnable_temp(ts_proj, text_proj)
-        
-        # Log contrastive loss
-        self.log('test_contrastive_loss', contrastive_loss, on_step=False, on_epoch=True)
-        
-        # Initialize total_loss with contrastive_loss
-        total_loss = contrastive_loss
-        
-        # Add PHEcode prediction loss if enabled
-        if self.use_phecode_loss and phecode_logits is not None:
-            phecode_loss = self.phecode_prediction_loss(phecode_logits, batch_data)
-            phecode_weight = getattr(self.args, 'phecode_loss_weight', 0.2)
-            total_loss = total_loss + phecode_weight * phecode_loss
-            self.log('test_phecode_loss', phecode_loss, on_step=False, on_epoch=True)
-        
-        # Log total loss
-        self.log('test_loss', total_loss, on_step=False, on_epoch=True)
-        
-        return total_loss
+        """PyTorch Lightning test step - skipped as we use separate downstream evaluation"""
+        # Skip detailed testing - proper downstream evaluation is done separately
+        # in train_downstream_heads.py after training
+        return None
     
     def configure_optimizers(self):
-        """Configure optimizers for training"""
+        """Configure optimizers for training with cosine annealing and warmup"""
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
-        return optimizer
+        
+        # Get total number of training steps
+        total_steps = self.trainer.estimated_stepping_batches
+        
+        # Number of warmup steps (typically 10% of total steps)
+        warmup_steps = int(0.1 * total_steps)
+        
+        # Create a cosine annealing scheduler with warmup
+        # Using math.cos instead of torch.cos since step is a Python float
+        scheduler = {
+            'scheduler': torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lambda step: min(1.0, step / warmup_steps) * 0.5 * (1 + math.cos(math.pi * step / total_steps)) 
+                if step <= total_steps else 0.0
+            ),
+            'interval': 'step',
+            'frequency': 1
+        }
+        
+        return [optimizer], [scheduler]
         
     def transfer_batch_to_device(self, batch, device, dataloader_idx=None):
         """

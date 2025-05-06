@@ -37,6 +37,9 @@ export PATH="$INSTALL_DIR/bin:$PATH"
 # ─── Step 3: Shell integration ───────────────────────────────────────
 echo ">>> Initializing shell integration..."
 micromamba shell init -s bash -y >/dev/null || true
+
+export MAMBA_ROOT_PREFIX="$INSTALL_DIR"
+
 eval "$(micromamba shell hook --shell bash)"
 
 # ─── Step 4: Create environment ──────────────────────────────────────

@@ -4,6 +4,14 @@ import torch
 # Set global default tensor type to float32 for MPS compatibility
 torch.set_default_dtype(torch.float32)
 
+# Enable Tensor Core operations on supported CUDA devices
+if torch.cuda.is_available():
+    device_name = torch.cuda.get_device_name()
+    # Check if device likely has Tensor Cores (A100, V100, RTX series, etc.)
+    if any(gpu_type in device_name for gpu_type in ['A100', 'A10', 'V100', 'RTX', 'Ampere', 'Volta', 'Turing']):
+        torch.set_float32_matmul_precision('high')
+        print(f"Enabled high precision Tensor Core operations on {device_name}")
+
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -48,6 +56,12 @@ def main(args):
     # Set random seeds for reproducibility
     seed_everything(args.seed)
     
+    # Force sensor_wise_mask to be True
+    args.sensor_wise_mask = True
+    
+    # Disable debug printing
+    toggle_debug(False)
+    
     # Create directories
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
@@ -69,8 +83,8 @@ def main(args):
     # Model checkpoint callback
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.checkpoint_dir,
-        filename=f"contrastive_{args.model_type}_" + "{epoch:02d}-{val_loss:.4f}",
-        monitor='val_loss',
+        filename=f"contrastive_{args.model_type}_" + "{epoch:02d}-{train_contrastive_loss:.4f}",
+        monitor='train_contrastive_loss',
         mode='min',
         save_top_k=1 if not args.save_all_checkpoints else -1,
         save_last=True,
@@ -81,7 +95,7 @@ def main(args):
     # Early stopping callback if enabled
     if args.early_stopping:
         early_stop_callback = EarlyStopping(
-            monitor='val_loss',
+            monitor='train_contrastive_loss',
             mode='min',
             patience=args.patience,
             verbose=True
@@ -153,7 +167,7 @@ if __name__ == "__main__":
     parser.add_argument('--d_model', type=int, default=256, help='Dimension of model')
     parser.add_argument('--nlayers', type=int, default=2, help='Number of transformer layers')
     parser.add_argument('--global_structure_path', type=str, default=None, help='Path to global structure')
-    parser.add_argument('--sensor_wise_mask', action='store_true', help='Use sensor-wise masking')
+    parser.add_argument('--sensor_wise_mask', type=bool, default=True, help='Use sensor-wise masking (defaults to True)')
     parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads')
     
     # Contrastive learning arguments
@@ -161,6 +175,8 @@ if __name__ == "__main__":
                         help='Contrastive learning method')
     parser.add_argument('--pooling_type', type=str, default='attention', choices=['weighted_sum', 'attention'],
                         help='Pooling type for discharge summary encoder')
+    parser.add_argument('--temperature', type=float, default=0.07, 
+                        help='Temperature parameter for contrastive loss')
     
     # Training arguments
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
@@ -179,6 +195,10 @@ if __name__ == "__main__":
     parser.add_argument('--precision', type=str, default='32', help='Precision for training (16, 32, 64)')
     parser.add_argument('--strategy', type=str, default=None, help='Distributed training strategy')
     parser.add_argument('--devices', type=int, default=None, help='Number of devices to use')
+    
+    # New argument for PHEcode loss
+    parser.add_argument('--use_phecode_loss', type=lambda x: x.lower() in ['true', 't', 'yes', 'y', '1'], 
+                        default=True, help='Enable PHEcode auxiliary loss (true/false)')
     
     args = parser.parse_args()
     main(args)
