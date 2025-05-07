@@ -48,8 +48,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
         self.label_window    = label_window
         self.T               = T
         self.test_ds_only    = test_ds_only
-        self.device          = get_device()
-
+        
         # ────────────────── label cache ──────────────────
         label_dir = os.path.join(self.cache_dir, "label_cache")
 

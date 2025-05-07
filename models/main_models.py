@@ -41,7 +41,6 @@ class DSEncoderWithWeightedSum(nn.Module):
         
         self.pooling_type = pooling_type
         self.hidden_dim = hidden_dim
-        self.device = get_device()
         
         # Project from embedding dimension (768) to hidden dimension
         self.embedding_proj = nn.Linear(768, hidden_dim)
@@ -69,14 +68,9 @@ class DSEncoderWithWeightedSum(nn.Module):
             nn.Linear(hidden_dim, projection_dim),
             nn.ReLU()
         )
-        
-        # Move all layers to device
-        self.to(self.device)
 
     def _weighted_sum_pooling(self, embs):
         """Weighted sum pooling implementation"""
-        # Ensure input is on correct device
-        embs = embs.to(self.device)
         scores = self.weight_proj(embs).squeeze(-1)  # [T_i]
         weights = torch.softmax(scores, dim=0)  # [T_i]
         pooled = (weights.unsqueeze(-1) * embs).sum(dim=0)  # [hidden_dim]
@@ -86,8 +80,6 @@ class DSEncoderWithWeightedSum(nn.Module):
 
     def _attention_pooling(self, embs):
         """Multi-head attention pooling implementation"""
-        # Ensure input is on correct device
-        embs = embs.to(self.device)
         batch_size = embs.size(0) if len(embs.shape) > 2 else 1
         seq_len = embs.size(0) if len(embs.shape) > 2 else embs.size(0)
         
@@ -147,7 +139,10 @@ class DSEncoderWithWeightedSum(nn.Module):
             for embs in discharge_embeddings:
                 if embs.numel() == 0:  # Empty tensor
                     dim = output_dim or self.projection[0].out_features
-                    outputs.append(torch.zeros(dim, device=self.device))
+                    # Create zero tensor with same device as first non-empty tensor in the list
+                    device = next((e.device for e in discharge_embeddings if e.numel() > 0), 
+                                 torch.device('cpu'))
+                    outputs.append(torch.zeros(dim, device=device))
                     continue
                     
                 if self.pooling_type == 'weighted_sum':
@@ -183,7 +178,6 @@ class KEDGN(nn.Module):
         self.num_of_variables = num_of_variables
         self.num_of_timestamps = num_of_timestamps
         self.hidden_dim = hidden_dim
-        self.DEVICE = DEVICE
         self.use_clusters = use_clusters
         self.cluster_labels = cluster_labels
         self.task_mode = task_mode
@@ -273,7 +267,7 @@ class KEDGN(nn.Module):
                 nn.Linear(num_of_variables+ hidden_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, output_dim)
-            ).to(DEVICE)
+            )
         else:
             self.classifier = nn.Sequential(
                 nn.Linear(num_of_variables, hidden_dim),
@@ -281,8 +275,7 @@ class KEDGN(nn.Module):
                 nn.Linear(hidden_dim, output_dim)
             )
         
-        self.to(DEVICE)
-        logging.info("KEDGN initialized on device: {}".format(DEVICE))
+        logging.info("KEDGN initialized")
 
     def forward(self, P, P_static, P_avg_interval, P_length, P_time, P_var_plm_rep_tensor):
         """

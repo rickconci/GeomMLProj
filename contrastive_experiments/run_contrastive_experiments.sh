@@ -3,6 +3,7 @@
 # Contrastive Learning Experiments with Integrated Downstream Evaluation
 # This script performs a hyperparameter sweep for contrastive learning
 # Now with integrated downstream task evaluation during validation
+# Supports distributed data parallel (DDP) training
 
 # Set common parameters
 DATA_PATH="/path/to/mimic/data"  # Update this path
@@ -13,6 +14,12 @@ MODEL_TYPE="raindrop_v2"
 RESULTS_ROOT="contrastive_results/hyperparameter_sweep"
 CHECKPOINT_DIR="${RESULTS_ROOT}/checkpoints"
 LOGS_DIR="${RESULTS_ROOT}/logs"
+
+# Distributed training settings
+NUM_GPUS=8 # Set number of GPUs to use
+STRATEGY="ddp_find_unused_parameters_true"  # DDP strategy
+ACCELERATOR="gpu"  # Use GPU acceleration
+PRECISION="32"  # Use 32-bit precision (adjust to 16 for faster training if supported)
 
 # Create a run log to keep track of executions
 RUN_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -47,11 +54,12 @@ fi
 echo "Starting contrastive learning sweep with ${EPOCHS} epochs at $(date)" 
 echo "Run ID: $RUN_TIMESTAMP" 
 echo "Results will be saved to $RESULTS_ROOT"
+echo "Using $NUM_GPUS GPUs with $STRATEGY strategy"
 
 # Add entry to run history
 mkdir -p $(dirname "$RUN_LOG")
 echo "Run started at: $(date), ID: $RUN_TIMESTAMP" >> "$RUN_LOG"
-echo "Parameters: Epochs=$EPOCHS, Model=$MODEL_TYPE" >> "$RUN_LOG"
+echo "Parameters: Epochs=$EPOCHS, Model=$MODEL_TYPE, GPUs=$NUM_GPUS, Strategy=$STRATEGY" >> "$RUN_LOG"
 echo "----------------------------------------" >> "$RUN_LOG"
 
 
@@ -90,6 +98,7 @@ echo "D_Model: $D_MODEL" >> $CONFIG_FILE
 echo "Num Layers: $NLAYERS" >> $CONFIG_FILE
 echo "Num Heads: $NHEADS" >> $CONFIG_FILE
 echo "Use WandB: $USE_WANDB" >> $CONFIG_FILE
+echo "Distributed Training: GPUs=$NUM_GPUS, Strategy=$STRATEGY" >> $CONFIG_FILE
 echo "=========================================" >> $CONFIG_FILE
 
 # Main experiment loop
@@ -113,6 +122,7 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
             echo "RESULTS_ROOT = $RESULTS_ROOT"
             echo "PHEcode Loss: $USE_PHECODE_LOSS"
             echo "Temperature: $TEMP"
+            echo "Using $NUM_GPUS GPUs with $STRATEGY strategy"
             echo "========================================================"
             
             # Ensure directory exists
@@ -139,7 +149,12 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
               echo "Starting experiment: $RUN_NAME"
               echo "Batch Size: $BATCH_SIZE, Learning Rate: $LR, Random Seed: $SEED, Projection Dim: $PROJ_DIM"
               echo "PHEcode Loss: $USE_PHECODE_LOSS, Temperature: $TEMP"
+              echo "Using $NUM_GPUS GPUs with $STRATEGY strategy"
               echo "========================================================"
+              
+              # Calculate effective batch size for logging (per GPU batch size * num_gpus)
+              EFFECTIVE_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
+              echo "Effective batch size with $NUM_GPUS GPUs: $EFFECTIVE_BATCH_SIZE"
               
               # Run the contrastive experiment with integrated downstream evaluation
               python contrastive_experiments/train_contrastive_lighting.py \
@@ -162,7 +177,11 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
                 $USE_WANDB_FLAG \
                 --wandb_project $WANDB_PROJECT \
                 --contrastive_method "clip" \
-                --use_phecode_loss $USE_PHECODE_LOSS
+                --use_phecode_loss $USE_PHECODE_LOSS \
+                --accelerator $ACCELERATOR \
+                --strategy $STRATEGY \
+                --precision $PRECISION \
+                --devices $NUM_GPUS
               
               CONTRASTIVE_STATUS=$?
               echo "Completed contrastive experiment: $RUN_NAME (exit code: $CONTRASTIVE_STATUS)"
@@ -187,6 +206,8 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
                 echo "Configuration: $RUN_NAME" > $SUMMARY_FILE
                 echo "Batch Size: $BATCH_SIZE, Learning Rate: $LR, Seed: $SEED, Proj Dim: $PROJ_DIM" >> $SUMMARY_FILE
                 echo "PHEcode Loss: $USE_PHECODE_LOSS, Temperature: $TEMP" >> $SUMMARY_FILE
+                echo "Distributed Training: GPUs=$NUM_GPUS, Strategy=$STRATEGY" >> $SUMMARY_FILE
+                echo "Effective Batch Size: $EFFECTIVE_BATCH_SIZE" >> $SUMMARY_FILE
                 echo "Contrastive Checkpoint: $BEST_CHECKPOINT" >> $SUMMARY_FILE
                 
                 # If using wandb, extract metrics from there
@@ -213,6 +234,7 @@ SUMMARY_FILE="${RESULTS_ROOT}/all_results_summary.txt"
 echo "CONTRASTIVE TRAINING WITH INTEGRATED DOWNSTREAM EVALUATION SUMMARY" > $SUMMARY_FILE
 echo "Generated at: $(date)" >> $SUMMARY_FILE
 echo "Run ID: $RUN_TIMESTAMP" >> $SUMMARY_FILE
+echo "Distributed Training: GPUs=$NUM_GPUS, Strategy=$STRATEGY" >> $SUMMARY_FILE
 echo "=================================================" >> $SUMMARY_FILE
 
 # Find all summary.txt files and extract any available metrics

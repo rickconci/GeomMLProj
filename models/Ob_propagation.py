@@ -70,6 +70,9 @@ class Observation_progation(MessagePassing):
 
         self.ob_dim = ob_dim
         self.index = None
+        
+        # Initialize residual projection as None, will be lazily initialized if needed
+        self.residual_proj = None
 
         self.reset_parameters()
 
@@ -124,6 +127,45 @@ class Observation_progation(MessagePassing):
         """Here, the edge_attr is not edge weights, but edge features!
         If we want to the calculation contains edge weights, change the calculation of alpha"""
 
+        # Ensure all tensors are on the same device as x
+        device = x.device if isinstance(x, Tensor) else x[0].device
+        
+        # Ensure consistent dtype (Float32)
+        if isinstance(x, Tensor) and x.dtype == torch.float64:
+            x = x.to(torch.float32)
+        elif isinstance(x, tuple):
+            if x[0].dtype == torch.float64:
+                x = (x[0].to(torch.float32), x[1].to(torch.float32))
+                
+        if p_t.dtype == torch.float64:
+            p_t = p_t.to(torch.float32)
+            
+        if isinstance(edge_index, Tensor):
+            if edge_index.device != device:
+                edge_index = edge_index.to(device)
+            if edge_index.dtype == torch.float64:
+                edge_index = edge_index.to(torch.float32)
+            
+        if p_t.device != device:
+            p_t = p_t.to(device)
+            
+        if edge_weights is not None:
+            if hasattr(edge_weights, 'device') and edge_weights.device != device:
+                edge_weights = edge_weights.to(device)
+            if hasattr(edge_weights, 'dtype') and edge_weights.dtype == torch.float64:
+                edge_weights = edge_weights.to(torch.float32)
+            
+        if edge_attr is not None:
+            if hasattr(edge_attr, 'device') and edge_attr.device != device:
+                edge_attr = edge_attr.to(device)
+            if hasattr(edge_attr, 'dtype') and edge_attr.dtype == torch.float64:
+                edge_attr = edge_attr.to(torch.float32)
+
+        # Ensure model parameters are Float32
+        for param_name, param in self.named_parameters():
+            if param.dtype == torch.float64:
+                param.data = param.data.to(torch.float32)
+
         self.edge_index = edge_index
         self.p_t = p_t
         self.use_beta = use_beta
@@ -151,8 +193,8 @@ class Observation_progation(MessagePassing):
                 out = out + original_x
             else:
                 # If dimensions don't match, use a projection
-                if not hasattr(self, 'residual_proj'):
-                    self.residual_proj = Linear(original_x.size(-1), out.size(-1)).to(out.device)
+                if self.residual_proj is None:
+                    self.residual_proj = Linear(original_x.size(-1), out.size(-1))
                 out = out + self.residual_proj(original_x)
 
         if isinstance(return_attention_weights, bool):

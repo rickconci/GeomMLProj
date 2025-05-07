@@ -47,13 +47,13 @@ class RaindropContrastiveModel(pl.LightningModule):
         self.args = args
         self.save_hyperparameters(vars(args))
         seed_everything(args.seed)
-        self.init_wandb()
         os.makedirs(args.checkpoint_dir, exist_ok=True)
                 
         self.dims = dims
         self.log_temperature = nn.Parameter(torch.ones(1) * np.log(1.0 / args.temperature))
         self.use_phecode_loss = getattr(args, 'use_phecode_loss', True)
         self.phe_code_size = self.dims['phecode_size']
+        
         
         # Initialize model components if dimensions are provided
         if dims is not None:
@@ -76,23 +76,6 @@ class RaindropContrastiveModel(pl.LightningModule):
         
         logging.info(f"Using device: {self.device}")
     
-    def init_wandb(self):
-        """Initialize Weights & Biases tracking if enabled"""
-        if self.args.use_wandb:
-            try:
-                dotenv.load_dotenv('dot_env.txt')
-                wandb.login(key=os.getenv("WANDB_API_KEY"))
-                self.run = wandb.init(
-                    project=self.args.wandb_project,
-                    entity=self.args.wandb_entity,
-                    config=vars(self.args)
-                )
-                wandb.config.update({"device": str(self.device)})
-                logging.info("Successfully initialized wandb")
-            except Exception as e:
-                logging.warning(f"Failed to initialize wandb: {e}")
-                logging.info("Continuing without wandb logging")
-                self.args.use_wandb = False
     
     def get_temperature(self):
         """Get the current temperature value (inverse of log_temperature)"""
@@ -237,7 +220,7 @@ class RaindropContrastiveModel(pl.LightningModule):
         temperature = self.get_temperature()
         
         # Log the temperature
-        self.log('temperature', temperature.item(), on_step=False, on_epoch=True)
+        self.log('temperature', temperature.item(), on_step=False, on_epoch=True, sync_dist=True, batch_size=ts_proj.shape[0])
         
         # Use the existing contrastive loss functions from train_utils.py
         if self.args.contrastive_method == 'clip':
@@ -273,7 +256,7 @@ class RaindropContrastiveModel(pl.LightningModule):
         
         ts_proj, text_proj, phecode_logits = self.model_forward(batch_data)
         contrastive_loss = self.contrastive_loss_with_learnable_temp(ts_proj, text_proj)
-        self.log('train_contrastive_loss', contrastive_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_contrastive_loss', contrastive_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_data['P'].shape[1])
         
         total_loss = contrastive_loss
         
@@ -282,51 +265,49 @@ class RaindropContrastiveModel(pl.LightningModule):
             phecode_loss = self.current_phecode_prediction_loss(phecode_logits, batch_data)
             phecode_weight = getattr(self.args, 'phecode_loss_weight', 0.01)
             total_loss = total_loss + phecode_weight * phecode_loss
-            self.log('train_phecode_loss', phecode_loss, on_step=True, on_epoch=True, prog_bar=True)
+            self.log('train_phecode_loss', phecode_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_data['P'].shape[1])
         
         # Log total loss
-        self.log('train_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_data['P'].shape[1])
         
         return total_loss
     
     def validation_step(self, batch, batch_idx):
         """PyTorch Lightning validation step - collect embeddings for downstream evaluation"""
+        # Only collect embeddings if we're on a validation epoch we care about
+        
         # Prepare batch data
         batch_data = self.prepare_batch(batch)
         if batch_data is None:
             return None
         
-        # Forward pass through model to get embeddings
+        # Forward pass through model to get embeddings (with no gradients)
         with torch.no_grad():
             ts_proj, text_proj, _ = self.model_forward(batch_data)
         
-        # No need to compute contrastive loss during validation
-        # Just collect embeddings and labels for downstream evaluation
+        # Collect embeddings and labels
         result = {
             'ts_proj': ts_proj.detach(),
-            'text_proj': text_proj.detach()
+            'text_proj': text_proj.detach(),
+            'mortality_label': batch_data['mortality_label'],
+            'readmission_label': batch_data['readmission_label'],
+            'next_idx_padded': batch_data['next_idx_padded'],
+            'next_phecode_len': batch_data['next_phecode_len']
         }
         
-        # Add labels for downstream tasks if available
-        for key in ['mortality_label', 'readmission_label', 'next_idx_padded', 'next_phecode_len']:
-            if key in batch:
-                result[key] = batch[key]
-        
-        # Important: log outputs for on_validation_epoch_end
         self.validation_step_outputs.append(result)
-        
         return result
     
     def on_validation_epoch_start(self):
-        """Initialize list to store validation step outputs and reset downstream heads"""
+        """Initialize list to store validation step outputs if needed"""
+        
+        logging.info(f"Running downstream evaluation at epoch {self.trainer.current_epoch+1}")
         self.validation_step_outputs = []
         
         # Reset weights of downstream prediction heads
         self._reset_classifier_weights(self.mortality_classifier)
         self._reset_classifier_weights(self.readmission_classifier)
         self._reset_classifier_weights(self.next_phecode_predictor)
-        
-        logging.info("Reset weights of downstream prediction heads for validation")
     
     def _reset_classifier_weights(self, model):
         """Reset the weights of a model to their initial values"""
@@ -339,76 +320,50 @@ class RaindropContrastiveModel(pl.LightningModule):
     
     def on_validation_epoch_end(self):
         """Train and evaluate downstream tasks at the end of validation epoch"""
-        outputs = self.validation_step_outputs
         
+        outputs = self.validation_step_outputs
         if not outputs:
             return
         
-        # Get current epoch number for logging
-        current_epoch = self.trainer.current_epoch
-        logging.info(f"Running validation tasks for epoch {current_epoch}")
+        # ALL_GATHER to collect data from all processes
+        all_gathered_ts_projs = self.all_gather([o['ts_proj'] for o in outputs if o is not None and 'ts_proj' in o])
+        all_gathered_text_projs = self.all_gather([o['text_proj'] for o in outputs if o is not None and 'text_proj' in o])
+        all_gathered_mortality_labels = self.all_gather([o['mortality_label'] for o in outputs if o is not None and 'mortality_label' in o])
+        all_gathered_readmission_labels = self.all_gather([o['readmission_label'] for o in outputs if o is not None and 'readmission_label' in o])
+        all_gathered_next_idx_padded = self.all_gather([o['next_idx_padded'] for o in outputs if o is not None and 'next_idx_padded' in o])
+        all_gathered_next_phecode_len = self.all_gather([o['next_phecode_len'] for o in outputs if o is not None and 'next_phecode_len' in o])
         
-        # Collect embeddings and labels
-        all_ts_projs = []
-        all_text_projs = []
-        all_mortality_labels = []
-        all_readmission_labels = []
-        all_next_idx_padded = []
-        all_next_lens = []
-        
-        for output in outputs:
-            if output is None:
-                continue
-                
-            if 'ts_proj' in output:
-                all_ts_projs.append(output['ts_proj'])
-            if 'text_proj' in output:
-                all_text_projs.append(output['text_proj'])
+        # Only rank 0 processes the gathered data
+        if self.global_rank == 0:
+            # Flatten gathered lists and concatenate tensors
+            ts_projs = torch.cat([item for sublist in all_gathered_ts_projs for item in sublist], dim=0)
+            text_projs = torch.cat([item for sublist in all_gathered_text_projs for item in sublist], dim=0)
+            concat_projs = torch.cat([ts_projs, text_projs], dim=1)
             
-            # Collect labels
-            if 'mortality_label' in output:
-                all_mortality_labels.append(output['mortality_label'])
-            if 'readmission_label' in output:
-                all_readmission_labels.append(output['readmission_label'])
-            if 'next_idx_padded' in output:
-                all_next_idx_padded.append(output['next_idx_padded'])
-            if 'next_len' in output:
-                all_next_lens.append(output['next_len'])
-        
-        # Skip if we don't have any embeddings
-        if not all_ts_projs or not all_text_projs:
-            return
+            mortality_labels = torch.cat([item for sublist in all_gathered_mortality_labels for item in sublist], dim=0)
+            readmission_labels = torch.cat([item for sublist in all_gathered_readmission_labels for item in sublist], dim=0)
+            next_idx_padded = torch.cat([item for sublist in all_gathered_next_idx_padded for item in sublist], dim=0)
+            next_lens = torch.cat([item for sublist in all_gathered_next_phecode_len for item in sublist], dim=0)
             
-        # Concatenate embeddings from all batches
-        ts_projs = torch.cat(all_ts_projs, dim=0)
-        text_projs = torch.cat(all_text_projs, dim=0)
-        
-        # Fused embeddings (average of ts and text)
-        fused_projs = (ts_projs + text_projs) / 2
-        concat_projs = torch.cat([ts_projs, text_projs], dim=1)
-
-        # Create a metrics dictionary to collect all results
-        all_metrics = {'epoch': current_epoch}
-        
-        # Train and evaluate downstream tasks
-        mortality_metrics = self._train_and_evaluate_mortality(concat_projs, all_mortality_labels)
-        readmission_metrics = self._train_and_evaluate_readmission(concat_projs, all_readmission_labels)
-        phecode_metrics = self._train_and_evaluate_phecodes(concat_projs, all_next_idx_padded, all_next_lens)
-        
-        # Update metrics dictionary with task-specific results
-        if mortality_metrics:
-            all_metrics.update({f'mortality_{k}': v for k, v in mortality_metrics.items()})
-        if readmission_metrics:
-            all_metrics.update({f'readmission_{k}': v for k, v in readmission_metrics.items()})
-        if phecode_metrics:
-            all_metrics.update({f'phecode_{k}': v for k, v in phecode_metrics.items()})
-        
-        # Log all metrics to wandb if available
-        if self.args.use_wandb and hasattr(self, 'run') and self.run is not None:
-            try:
-                # Create a metrics dict specifically for wandb with clearer naming
+            # Train and evaluate downstream tasks only on rank 0
+            all_metrics = {'epoch': self.trainer.current_epoch}
+            
+            mortality_metrics = self._train_and_evaluate_mortality(concat_projs, [mortality_labels])
+            readmission_metrics = self._train_and_evaluate_readmission(concat_projs, [readmission_labels])
+            phecode_metrics = self._train_and_evaluate_phecodes(concat_projs, [next_idx_padded], [next_lens])
+            
+            # Update metrics dictionary
+            if mortality_metrics:
+                all_metrics.update({f'mortality_{k}': v for k, v in mortality_metrics.items()})
+            if readmission_metrics:
+                all_metrics.update({f'readmission_{k}': v for k, v in readmission_metrics.items()})
+            if phecode_metrics:
+                all_metrics.update({f'phecode_{k}': v for k, v in phecode_metrics.items()})
+            
+            # Log to wandb if available
+            if self.args.use_wandb:
                 wandb_metrics = {
-                    'epoch': current_epoch,
+                    'epoch': self.trainer.current_epoch,
                     'val_downstream/mortality_auroc': all_metrics.get('mortality_auroc', 0.0),
                     'val_downstream/mortality_auprc': all_metrics.get('mortality_auprc', 0.0),
                     'val_downstream/readmission_auroc': all_metrics.get('readmission_auroc', 0.0),
@@ -418,12 +373,7 @@ class RaindropContrastiveModel(pl.LightningModule):
                     'val_downstream/phecode_micro_ap': all_metrics.get('phecode_micro_ap', 0.0),
                     'val_downstream/phecode_prec@5': all_metrics.get('phecode_prec@5', 0.0),
                 }
-                
-                # Log to wandb with the current epoch
-                wandb.log(wandb_metrics, step=current_epoch)
-                logging.info(f"Logged validation metrics to wandb for epoch {current_epoch}")
-            except Exception as e:
-                logging.warning(f"Failed to log metrics to wandb: {str(e)}")
+                wandb.log(wandb_metrics, step=self.trainer.current_epoch)
     
     def _train_classifier(self, classifier, embeddings, targets, is_multilabel=False, valid_samples=None):
         """
@@ -549,8 +499,8 @@ class RaindropContrastiveModel(pl.LightningModule):
         metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), targets.cpu().numpy())
         
         # Log metrics
-        self.log('val_mortality_auroc', metrics['auroc'], on_epoch=True)
-        self.log('val_mortality_auprc', metrics['auprc'], on_epoch=True)
+        self.log('val_mortality_auroc', metrics['auroc'], on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
+        self.log('val_mortality_auprc', metrics['auprc'], on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
         
         logging.info(f"Mortality classifier performance - AUROC: {metrics['auroc']:.4f}, AUPRC: {metrics['auprc']:.4f}")
         
@@ -587,8 +537,8 @@ class RaindropContrastiveModel(pl.LightningModule):
         metrics = calculate_binary_classification_metrics(preds.cpu().numpy(), targets.cpu().numpy())
         
         # Log metrics
-        self.log('val_readmission_auroc', metrics['auroc'], on_epoch=True)
-        self.log('val_readmission_auprc', metrics['auprc'], on_epoch=True)
+        self.log('val_readmission_auroc', metrics['auroc'], on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
+        self.log('val_readmission_auprc', metrics['auprc'], on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
         
         logging.info(f"Readmission classifier performance - AUROC: {metrics['auroc']:.4f}, AUPRC: {metrics['auprc']:.4f}")
         
@@ -661,10 +611,10 @@ class RaindropContrastiveModel(pl.LightningModule):
             phecode_metrics = calculate_phecode_metrics(preds.cpu().numpy(), targets.cpu().numpy())
             
             # Log metrics
-            self.log('val_phecode_micro_auc', phecode_metrics.get('micro_auc', 0.0), on_epoch=True)
-            self.log('val_phecode_macro_auc', phecode_metrics.get('macro_auc', 0.0), on_epoch=True)
-            self.log('val_phecode_micro_ap', phecode_metrics.get('micro_ap', 0.0), on_epoch=True)
-            self.log('val_phecode_prec@5', phecode_metrics.get('prec@5', 0.0), on_epoch=True)
+            self.log('val_phecode_micro_auc', phecode_metrics.get('micro_auc', 0.0), on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
+            self.log('val_phecode_macro_auc', phecode_metrics.get('macro_auc', 0.0), on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
+            self.log('val_phecode_micro_ap', phecode_metrics.get('micro_ap', 0.0), on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
+            self.log('val_phecode_prec@5', phecode_metrics.get('prec@5', 0.0), on_epoch=True, sync_dist=True, batch_size=embeddings.shape[0])
             
             # Log detailed metrics
             logging.info(f"PHEcode classifier performance:")

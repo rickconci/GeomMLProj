@@ -68,7 +68,6 @@ class ContrastiveDataModule(pl.LightningDataModule):
         self.test_ds_only = test_ds_only
         self.collate_fn = collate_fn or float32_collate_fn
         self.drop_last = drop_last
-        self.device = get_device()
         
         # These will be set in the setup method
         self.train_dataset = None
@@ -131,16 +130,7 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 test_ds_only=self.test_ds_only
             )
             
-        # Load the variable embeddings
-        embeddings, _ = get_var_embeddings(self.data_path, self.temp_dfs_path)
-        
-        # Ensure embeddings are float32
-        if isinstance(embeddings, torch.Tensor) and embeddings.dtype == torch.float64:
-            logging.info("Converting variable embeddings from float64 to float32 for MPS compatibility")
-            embeddings = embeddings.to(dtype=torch.float32)
             
-        self.var_embeddings = embeddings
-    
     def train_dataloader(self):
         """Return the training dataloader"""
         return DataLoader(
@@ -149,7 +139,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             collate_fn=self.collate_fn,
-            drop_last=self.drop_last,
+            prefetch_factor=2,
+            persistent_workers=True,
             pin_memory=True
         )
     
@@ -162,7 +153,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=self.collate_fn,
             drop_last=self.drop_last,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True
         )
     
     def test_dataloader(self):

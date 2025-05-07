@@ -1,6 +1,8 @@
 import os
 import argparse
 import torch
+# Enable cuDNN autotuner to select optimal convolution algorithms for fixed input sizes
+torch.backends.cudnn.benchmark = True
 # Set global default tensor type to float32 for MPS compatibility
 torch.set_default_dtype(torch.float32)
 
@@ -54,6 +56,32 @@ logging.basicConfig(
 device = get_device()
 
 
+def init_wandb(args):
+    """Initialize Weights & Biases tracking if enabled"""
+    if args.use_wandb:
+        # Check if this is the main process (rank 0)
+        is_main_process = os.environ.get('LOCAL_RANK', '0') == '0'
+        
+        if is_main_process:
+            try:
+                dotenv.load_dotenv('dot_env.txt')
+                wandb.login(key=os.getenv("WANDB_API_KEY"))
+                run = wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    config=vars(args)
+                )
+                wandb.config.update({"device": str(device)})
+                logging.info("Successfully initialized wandb")
+            except Exception as e:
+                logging.warning(f"Failed to initialize wandb: {e}")
+                logging.info("Continuing without wandb logging")
+                args.use_wandb = False
+        else:
+            logging.info("Non-main process: Skipping wandb initialization")
+            args.use_wandb = False
+
+
 def main(args):
     # Set random seeds for reproducibility
     seed_everything(args.seed)
@@ -63,6 +91,8 @@ def main(args):
     
     # Disable debug printing
     toggle_debug(False)
+    
+    init_wandb(args)
     
     args.checkpoint_dir = os.path.abspath(args.checkpoint_dir)
     
@@ -140,19 +170,25 @@ def main(args):
     # Configure logger
     logger = None
     if args.use_wandb:
-        try:
-            dotenv.load_dotenv('dot_env.txt')
-            wandb.login(key=os.getenv("WANDB_API_KEY"))
-            logger = WandbLogger(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                log_model=True,
-                save_dir=args.checkpoint_dir
-            )
-            logger.log_hyperparams(vars(args))
-        except Exception as e:
-            logging.warning(f"Failed to initialize wandb: {e}")
-            logging.info("Continuing without wandb logging")
+        # Only initialize WandB logger on main process (rank 0)
+        is_main_process = os.environ.get('LOCAL_RANK', '0') == '0'
+        
+        if is_main_process:
+            try:
+                dotenv.load_dotenv('dot_env.txt')
+                wandb.login(key=os.getenv("WANDB_API_KEY"))
+                logger = WandbLogger(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    log_model=True,
+                    save_dir=args.checkpoint_dir
+                )
+                logger.log_hyperparams(vars(args))
+            except Exception as e:
+                logging.warning(f"Failed to initialize wandb: {e}")
+                logging.info("Continuing without wandb logging")
+        else:
+            logging.info("Non-main process: Not creating WandB logger")
     
     # Force everything to float32 for MPS compatibility
     # Override any specified precision
@@ -166,12 +202,14 @@ def main(args):
         logger=logger,
         accelerator=args.accelerator,
         precision=forced_precision,
-        strategy=args.strategy if args.strategy else 'auto',
-        devices=get_lightning_devices(args.devices),
+        strategy=args.strategy,
+        sync_batchnorm=True,
+        devices= list(range(get_lightning_devices(args.devices))),
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         enable_checkpointing=True,
         enable_model_summary=True,  
-        log_every_n_steps=10
+        log_every_n_steps=10,
+        profiler = 'simple'
     )
     
     # Train the model
@@ -243,7 +281,9 @@ if __name__ == "__main__":
     # Lightning specific arguments
     parser.add_argument('--accelerator', type=str, default='auto', help='Accelerator to use (auto, cpu, gpu, tpu)')
     parser.add_argument('--precision', type=str, default='32', help='Precision for training (16, 32, 64)')
-    parser.add_argument('--strategy', type=str, default=None, help='Distributed training strategy')
+    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_true', 
+                        choices=['ddp', 'ddp_spawn','auto', 'ddp_find_unused_parameters_true'], 
+                        help='Distributed training strategy')
     parser.add_argument('--devices', type=int, default=None, help='Number of devices to use')
     
     # New argument for PHEcode loss
@@ -252,8 +292,7 @@ if __name__ == "__main__":
     
     
     # Add lightning specific parameters
-    parser.add_argument('--check_val_every_n_epoch', type=int, default=3,
-                        help='Run validation every n epochs')
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=3, help='Run validation every n epochs')
     
     args = parser.parse_args()
     main(args)

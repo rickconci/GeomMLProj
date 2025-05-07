@@ -29,21 +29,29 @@ class PositionalEncodingTF(nn.Module):
         self._num_timescales = d_model // 2
 
     def getPE(self, P_time):
+        # Get the device of the input tensor
+        device = P_time.device
         B = P_time.shape[1]
+        
+        # Ensure input is float32
+        if P_time.dtype == torch.float64:
+            P_time = P_time.to(torch.float32)
 
-        timescales = self.max_len ** np.linspace(0, 1, self._num_timescales)
+        # Use numpy linspace but convert to torch float32 tensor immediately
+        timescales = np.linspace(0, 1, self._num_timescales)
+        timescales = self.max_len ** timescales
+        # Convert timescales to a tensor on the same device with explicit dtype
+        timescales = torch.tensor(timescales, device=device, dtype=torch.float32)
 
-        times = torch.Tensor(P_time.cpu()).unsqueeze(2)
-        scaled_time = times / torch.Tensor(timescales[None, None, :])
+        # Avoid CPU conversion, keep everything on the input tensor's device
+        times = P_time.unsqueeze(2)
+        scaled_time = times / timescales[None, None, :]
         pe = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], axis=-1)  # T x B x d_model
-        pe = pe.type(torch.FloatTensor)
 
         return pe
 
     def forward(self, P_time):
         pe = self.getPE(P_time)
-        pe = pe.to(device)
-        debug_print(f"PositionalEncodingTF output shape: {pe.shape}")
         return pe
 
 
@@ -93,9 +101,9 @@ class Raindrop_v2(nn.Module):
 
         self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
 
-        self.adj = torch.ones([self.d_inp, self.d_inp]).to(device)
+        self.adj = torch.ones([self.d_inp, self.d_inp])
 
-        self.R_u = Parameter(torch.Tensor(1, self.d_inp*self.d_ob)).to(device)
+        self.R_u = Parameter(torch.Tensor(1, self.d_inp*self.d_ob))
 
         self.ob_propagation = Observation_progation(in_channels=max_len*self.d_ob, out_channels=max_len*self.d_ob, heads=1,
                                                     n_nodes=d_inp, ob_dim=self.d_ob)
@@ -142,6 +150,24 @@ class Raindrop_v2(nn.Module):
         times = Ptime: [215, 128]: the timestamps
         lengths = lengths: [128]: the number of nonzero recordings.
         """
+        # Get the device from input tensor for consistent device usage
+        device = src.device
+        
+        # Ensure all inputs have consistent dtype (Float32)
+        if src.dtype == torch.float64:
+            src = src.to(torch.float32)
+        if static is not None and static.dtype == torch.float64:
+            static = static.to(torch.float32)
+        if times.dtype == torch.float64:
+            times = times.to(torch.float32)
+        if lengths.dtype == torch.float64:
+            lengths = lengths.to(torch.float32)
+            
+        # Ensure model parameters are also Float32
+        for param in self.parameters():
+            if param.dtype == torch.float64:
+                param.data = param.data.to(torch.float32)
+        
         maxlen, batch_size = src.shape[0], src.shape[1]
         debug_print(f"[Raindrop_v2] Input src shape: {src.shape}, static shape: {None if static is None else static.shape}")
         debug_print(f"[Raindrop_v2] times shape: {times.shape}, lengths shape: {lengths.shape}")
@@ -167,8 +193,9 @@ class Raindrop_v2(nn.Module):
         h = self.dropout(h)
 
         #Create a boolean mask indicating padding positions in the time dimension  - used to mask out padding tokens in the transformer encoder
-        mask = torch.arange(maxlen)[None, :] >= (lengths.cpu()[:, None])
-        mask = mask.squeeze(1).to(device)
+        # Get the device of src to ensure consistent device usage
+        mask = torch.arange(maxlen, device=device)[None, :] >= (lengths[:, None])
+        mask = mask.squeeze(1)
         debug_print(f"[Raindrop_v2] Mask shape: {mask.shape}")
 
         step1 = True
@@ -177,8 +204,10 @@ class Raindrop_v2(nn.Module):
             output = x
             distance = 0
         elif step1 == True:
-            adj = self.global_structure.to(device)
-            adj[torch.eye(self.d_inp).bool()] = 1
+            adj = self.global_structure
+            if adj.device != device:
+                adj = adj.to(device)
+            adj[torch.eye(self.d_inp, device=device).bool()] = 1
 
             edge_index = torch.nonzero(adj).T
             edge_weights = adj[edge_index[0], edge_index[1]]
@@ -186,13 +215,13 @@ class Raindrop_v2(nn.Module):
 
             batch_size = src.shape[1]
             n_step = src.shape[0]
-            output = torch.zeros([n_step, batch_size, self.d_inp*self.d_ob]).to(device)
+            output = torch.zeros([n_step, batch_size, self.d_inp*self.d_ob], device=device)
 
             use_beta = False #False
             if use_beta == True:
-                alpha_all = torch.zeros([int(edge_index.shape[1]/2), batch_size]).to(device)
+                alpha_all = torch.zeros([int(edge_index.shape[1]/2), batch_size], device=device)
             else:
-                alpha_all = torch.zeros([edge_index.shape[1],  batch_size]).to(device)
+                alpha_all = torch.zeros([edge_index.shape[1], batch_size], device=device)
             debug_print(f"[Raindrop_v2] alpha_all initial shape: {alpha_all.shape}")
             
             for unit in range(0, batch_size):
@@ -207,7 +236,7 @@ class Raindrop_v2(nn.Module):
                 debug_print(f"[Raindrop_v2] After reshape, stepdata shape: {stepdata.shape}")
 
                 stepdata, attentionweights = self.ob_propagation(stepdata, p_t=p_t, edge_index=edge_index, edge_weights=edge_weights,
-                                 use_beta=use_beta,  edge_attr=None, return_attention_weights=True, residual=True)
+                                 use_beta=use_beta, edge_attr=None, return_attention_weights=True, residual=True)
                 debug_print(f"[Raindrop_v2] After ob_propagation, stepdata shape: {stepdata.shape}")
 
                 edge_index_layer2 = attentionweights[0]
@@ -215,7 +244,7 @@ class Raindrop_v2(nn.Module):
                 debug_print(f"[Raindrop_v2] edge_index_layer2 shape: {edge_index_layer2.shape}, edge_weights_layer2 shape: {edge_weights_layer2.shape}")
 
                 stepdata, attentionweights = self.ob_propagation_layer2(stepdata, p_t=p_t, edge_index=edge_index_layer2, edge_weights=edge_weights_layer2,
-                                 use_beta=False,  edge_attr=None, return_attention_weights=True, residual=True)
+                                 use_beta=False, edge_attr=None, return_attention_weights=True, residual=True)
                 debug_print(f"[Raindrop_v2] After ob_propagation_layer2, stepdata shape: {stepdata.shape}")
 
                 #reshape data from Nodes x Time x Features to Time x Nodes x Features
@@ -265,7 +294,7 @@ class Raindrop_v2(nn.Module):
             debug_print(f"[Raindrop_v2] lengths2 shape: {lengths2.shape}, mask2 shape: {mask2.shape}")
             
             if sensor_wise_mask:
-                output = torch.zeros([batch_size,self.d_inp, self.d_ob+16]).to(device)
+                output = torch.zeros([batch_size, self.d_inp, self.d_ob+16], device=device)
                 extended_missing_mask = missing_mask.view(-1, batch_size, self.d_inp)
                 debug_print(f"[Raindrop_v2] extended_missing_mask shape: {extended_missing_mask.shape}")
                 
