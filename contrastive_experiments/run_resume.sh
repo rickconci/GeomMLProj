@@ -31,7 +31,8 @@ fi
 WANDB_PROJECT="GeomML_Contrastive_Sweep"
 
 # RESUME CONFIGURATION - Change these values to match the run you want to resume
-BATCH_SIZE=256
+# REDUCED from 256 to 64 to address CUDA OOM errors
+BATCH_SIZE=64
 LR=0.001
 SEED=6525
 PROJ_DIM=256
@@ -72,6 +73,7 @@ echo "========================================================"
 EFFECTIVE_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
 echo "Effective batch size with $NUM_GPUS GPUs: $EFFECTIVE_BATCH_SIZE"
 
+
 # Run the contrastive experiment with integrated downstream evaluation
 python contrastive_experiments/train_contrastive_lighting.py \
   --data_path $DATA_PATH \
@@ -98,6 +100,7 @@ python contrastive_experiments/train_contrastive_lighting.py \
   --strategy $STRATEGY \
   --precision $PRECISION \
   --devices $NUM_GPUS \
+  --accumulate_grad_batches 4 \
   --resume_from_checkpoint "$CHECKPOINT_FILE"
 
 CONTRASTIVE_STATUS=$?

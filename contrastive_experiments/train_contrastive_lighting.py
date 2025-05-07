@@ -40,21 +40,8 @@ from models.models_utils import ProjectionHead
 
 from ContrastiveDataloaderLighting import ContrastiveDataModule
 from RaindropContrastive_lightning import RaindropContrastiveModel
-# Import the downstream evaluation function - ensure it's using the correct path
-from contrastive_experiments.train_downstream_heads import train_downstream_tasks
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f'logs/contrastive_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-        logging.StreamHandler()
-    ]
-)
 
 device = get_device()
-
 
 def init_wandb(args):
     """Initialize Weights & Biases tracking if enabled"""
@@ -83,6 +70,36 @@ def init_wandb(args):
 
 
 def main(args):
+    # Set up logging only on main process (rank 0)
+    is_main_process = os.environ.get('LOCAL_RANK', '0') == '0'
+    
+    if is_main_process:
+        # Convert checkpoint_dir to absolute path if it isn't already
+        checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+        # The logs directory should be at the same level as the checkpoint directory
+        logs_dir = os.path.join(os.path.dirname(checkpoint_dir), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        # Debug print the paths
+        print(f"Checkpoint dir (abs): {checkpoint_dir}")
+        print(f"Logs dir (abs): {logs_dir}")
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(os.path.join(logs_dir, f'contrastive_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')),
+                logging.StreamHandler()
+            ]
+        )
+    else:
+        # For non-main processes, just set up basic console logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[logging.StreamHandler()]
+        )
+    
     # Set random seeds for reproducibility
     seed_everything(args.seed)
     
@@ -129,7 +146,7 @@ def main(args):
         'sensor_wise_mask': True
     }
     
-    # Initialize model with data module and hardcoded dimensions
+ 
     model = RaindropContrastiveModel(args, dims=dims)
     
     # Configure callbacks
@@ -209,17 +226,20 @@ def main(args):
         enable_checkpointing=True,
         enable_model_summary=True,  
         log_every_n_steps=10,
-        profiler = 'simple'
+        profiler = 'simple',
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        #num_sanity_val_steps=0,  # Disable sanity validation completely
+        limit_val_batches=0.1 if args.fast_dev_run else 1.0  # Limit validation batches in normal runs
     )
     
+
     # Train the model
     if args.resume_from_checkpoint:
         trainer.fit(model, data_module, ckpt_path=args.resume_from_checkpoint)
     else:
         trainer.fit(model, data_module)
     
-    # Test the model
-    trainer.test(model, data_module)
+  
     
     # Get checkpoint path - try best first, then last if best not available
     best_model_path = checkpoint_callback.best_model_path
@@ -230,7 +250,6 @@ def main(args):
         last_model_path = checkpoint_callback.last_model_path
         logging.info(f"Best model not found, using last model: {last_model_path}")
         checkpoint_path = last_model_path
-  
 
 
 if __name__ == "__main__":
@@ -290,9 +309,9 @@ if __name__ == "__main__":
     parser.add_argument('--use_phecode_loss', type=lambda x: x.lower() in ['true', 't', 'yes', 'y', '1'], 
                         default=True, help='Enable PHEcode auxiliary loss (true/false)')
     
-    
     # Add lightning specific parameters
     parser.add_argument('--check_val_every_n_epoch', type=int, default=3, help='Run validation every n epochs')
-    
+    parser.add_argument('--accumulate_grad_batches', type=int, default=2, help='Accumulate gradients over n batches')
+    parser.add_argument('--fast_dev_run', action='store_true', help='Run a single training and validation batch for testing')
     args = parser.parse_args()
     main(args)

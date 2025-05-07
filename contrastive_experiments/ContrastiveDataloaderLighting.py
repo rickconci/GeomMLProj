@@ -117,6 +117,17 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 T=self.T,
                 test_ds_only=self.test_ds_only
             )
+        elif stage == 'validate':
+            # Only create validation dataset
+            self.val_dataset = MIMICContrastivePairsDatasetLite(
+                split="val",
+                cache_dir=self.temp_dfs_path,
+                task_mode=self.task_mode,
+                chunk_hours=self.chunk_hours,
+                label_window=self.label_window,
+                T=self.T,
+                test_ds_only=self.test_ds_only
+            )
         
         if stage == 'test' or stage is None:
             # Test dataset
