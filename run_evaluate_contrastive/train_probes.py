@@ -92,7 +92,7 @@ class LinearProbe(nn.Module):
     def forward(self, x):
         return self.classifier(x)
 
-def train_probe(model, train_loader, val_loader, criterion, optimizer, device, task_name, num_epochs=3):
+def train_probe(model, train_loader, val_loader, criterion, optimizer, device, task_name, num_epochs=10):
     """Train a probe model with validation"""
     best_val_metrics = None
     best_model_state = None
@@ -278,7 +278,7 @@ def main(args):
     
     # Initialize probes with hidden layers
     input_dim = dataset.ts_proj_dim + dataset.text_proj_dim
-    hidden_dim = 128
+    hidden_dim = args.hidden_dim
     
     mortality_probe = LinearProbe(input_dim, 1, hidden_dim).to(device)
     readmission_probe = LinearProbe(input_dim, 1, hidden_dim).to(device)
@@ -373,21 +373,22 @@ def main(args):
         wandb.log(results)
     
     # Save results
-    results_dir = os.path.join(args.embeddings_dir, 'probe_results')
+    hidden_suffix = f"_hidden{args.hidden_dim}" if args.hidden_dim is not None else "_linear"
+    results_dir = os.path.join(args.embeddings_dir, f'probe_results{hidden_suffix}')
     os.makedirs(results_dir, exist_ok=True)
     np.save(os.path.join(results_dir, f'epoch_{args.epoch}_results.npy'), results)
     
-    # Save probe models
-    #models_dir = os.path.join(results_dir, 'models')
-    #os.makedirs(models_dir, exist_ok=True)
-    #torch.save(mortality_probe.state_dict(), os.path.join(models_dir, f'epoch_{args.epoch}_mortality_probe.pt'))
-    #torch.save(readmission_probe.state_dict(), os.path.join(models_dir, f'epoch_{args.epoch}_readmission_probe.pt'))
-    #torch.save(phecode_probe.state_dict(), os.path.join(models_dir, f'epoch_{args.epoch}_phecode_probe.pt'))
+    # Save probe models if needed
+    # models_dir = os.path.join(results_dir, 'models')
+    # os.makedirs(models_dir, exist_ok=True)
+    # torch.save(mortality_probe.state_dict(), os.path.join(models_dir, f'epoch_{args.epoch}_mortality_probe.pt'))
+    # torch.save(readmission_probe.state_dict(), os.path.join(models_dir, f'epoch_{args.epoch}_readmission_probe.pt'))
+    # torch.save(phecode_probe.state_dict(), os.path.join(models_dir, f'epoch_{args.epoch}_phecode_probe.pt'))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--embeddings_dir', type=str, default='/home/ubuntu/GeomMLProj/Embeddings/bs128_lr0.001_seed42_proj256_temp0.07_nophe', help='Directory containing saved embeddings')
-    parser.add_argument('--epoch', type=int, default=0, help='Epoch number to evaluate')
+    parser.add_argument('--embeddings_dir', type=str, default='/Users/riccardoconci/Local_documents/!!GeomML_2025/GeomMLProj/Embeddings/bs128_lr0.001_seed42_proj256_temp0.07_nophe', help='Directory containing saved embeddings')
+    parser.add_argument('--epoch', type=int, default=7, help='Epoch number to evaluate')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training probes')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for training probes')
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension for probe networks')

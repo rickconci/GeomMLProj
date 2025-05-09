@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from data_scripts.generate_variable_embeddings import VariableEmbeddingGenerator
+from data_scripts.preprocess_data.generate_variable_embeddings import VariableEmbeddingGenerator
 from torch.utils.data._utils.collate import default_collate
 import time
 import pickle

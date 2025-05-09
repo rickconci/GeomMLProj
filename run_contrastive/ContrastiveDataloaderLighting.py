@@ -150,9 +150,9 @@ class ContrastiveDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             collate_fn=self.collate_fn,
-            prefetch_factor=2,
-            persistent_workers=True,
-            pin_memory=True
+            #prefetch_factor=4,
+            #persistent_workers=True,
+            #pin_memory=True
         )
     
     def val_dataloader(self):
@@ -164,8 +164,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=self.collate_fn,
             drop_last=self.drop_last,
-            pin_memory=True,
-            persistent_workers=True
+            #pin_memory=True,
+            #persistent_workers=True
         )
     
     def test_dataloader(self):
@@ -177,7 +177,7 @@ class ContrastiveDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=self.collate_fn,
             drop_last=self.drop_last,
-            pin_memory=True
+            #pin_memory=True
         )
     
     def get_var_embeddings(self):

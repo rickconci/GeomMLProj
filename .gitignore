@@ -7,7 +7,10 @@ wandb/
 *__pycache__/
 *data/
 .env 
-copy_dir_lambda.sh
 lightning_logs/
 checkpoints/
 test_checkpoints/
+*Embeddings/
+*hyperparameter_sweep/
+
+

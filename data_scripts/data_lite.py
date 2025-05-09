@@ -185,7 +185,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
                 "next_len":           nxt_len,   # int
                 "ds_embedding":       embedding,
             }
-        if self.task_mode == 'CONTRASTIVE':
+        if self.task_mode == 'CONTRASTIVE' or self.task_mode == 'MULTITASK':
             hadm_id = self.samples[idx]
             path = os.path.join(joint_cache_dir, full_cache_fn(hadm_id))
             # No need to check if path exists since we've filtered the samples
@@ -390,7 +390,7 @@ class MIMICContrastivePairsDatasetLite(Dataset):
         baseline_tensor = torch.tensor(meta.values[0], dtype=torch.float)
         return baseline_tensor
     
-    def split_by_subject_id(self, df, train_ratio=0.9, val_ratio=0.05, test_ratio=0.05, random_state=42):
+    def split_by_subject_id(self, df, train_ratio=0.7, val_ratio=0.29, test_ratio=0.01, random_state=42):
         """
         Split hospital admissions into train/val/test sets based on subject_id.
         This ensures that all admissions for a given patient are in the same split.

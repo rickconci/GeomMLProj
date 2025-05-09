@@ -53,10 +53,18 @@ class RaindropContrastiveModel(pl.LightningModule):
         self.dims = dims
         self.log_temperature = nn.Parameter(torch.ones(1) * np.log(1.0 / args.temperature))
         self.use_phecode_loss = getattr(args, 'use_phecode_loss', True)
-        self.phe_code_size = self.dims['phecode_size']
+        
+        # Initialize model components as None by default
+        self.ts_model = None
+        self.ds_encoder = None
+        self.ts_projection = None
+        self.text_projection = None
+        self.current_phecode_predictor = None
         
         # Initialize model components if dimensions are provided
-        if dims is not None:
+        # AND we're not loading from a checkpoint (args is not DummyArgs)
+        is_loading_from_checkpoint = isinstance(args, DummyArgs)
+        if dims is not None and not is_loading_from_checkpoint:
             self.init_model()
             
             # Log model parameters after initialization
@@ -67,12 +75,14 @@ class RaindropContrastiveModel(pl.LightningModule):
                 if module_name != 'total':
                     logging.info(f"  {module_name}: {param_count:,} ({param_count/param_details['total']*100:.1f}%)")
         else:
-            logging.warning("No dimensions provided, model will be initialized later")
-            self.ts_model = None
-            self.ds_encoder = None
-            self.ts_projection = None
-            self.text_projection = None
-            self.phecode_predictor = None
+            logging.info("Model will be initialized after checkpoint loading")
+            
+        # Set phe_code_size if dims is available
+        if dims is not None:
+            self.phe_code_size = self.dims.get('phecode_size', 1788)
+        else:
+            # Default value, will be overridden when dims becomes available
+            self.phe_code_size = 1788
         
         logging.info(f"Using device: {self.device}")
     
@@ -304,7 +314,7 @@ class RaindropContrastiveModel(pl.LightningModule):
                                                shape=(val_size, next_idx_shape[1])),  # Use actual shape from batch
                     'next_phecode_len': np.memmap(os.path.join(self.embeddings_dir, 'next_phecode_len.mmap'), 
                                                 dtype='int64', mode='w+', 
-                                                shape=(val_size,))
+                                                shape=(val_size,)),
                 }
                 
                 # Add hadm_id if present in dataset
@@ -410,12 +420,60 @@ class RaindropContrastiveModel(pl.LightningModule):
             # Convert hparams dict to an object with attributes
             class ArgsFromCheckpoint:
                 def __init__(self, hparams_dict):
+                    # Add default values for all required parameters 
+                    # These match the defaults in run_contrastive_experiments.sh
+                    self.d_model = 256
+                    self.hidden_dim = 256
+                    self.projection_dim = 256
+                    self.nlayers = 2
+                    self.num_heads = 2
+                    self.sensor_wise_mask = True
+                    self.pooling_type = 'attention'
+                    self.contrastive_method = 'clip'
+                    self.temperature = 0.07
+                    self.lr = 0.0005
+                    self.epochs = 20
+                    self.batch_size = 128
+                    self.seed = 42
+                    self.use_phecode_loss = True
+                    self.phecode_loss_weight = 0.1
+                    self.check_val_every_n_epoch = 4
+                    self.early_stopping = True
+                    self.patience = 5
+                    self.use_wandb = False
+                    self.accelerator = 'auto'
+                    self.precision = '32'
+                    self.strategy = 'ddp_find_unused_parameters_true'
+                    
+                    # Override with values from hparams if available
                     for key, value in hparams_dict.items():
                         setattr(self, key, value)
+                    
+                    # Log the parameters we're using
+                    logging.info(f"Loaded model with parameters: d_model={self.d_model}, "
+                                f"hidden_dim={self.hidden_dim}, projection_dim={self.projection_dim}, "
+                                f"nlayers={self.nlayers}, num_heads={self.num_heads}, "
+                                f"pooling_type={self.pooling_type}")
             
             # Create args object from hyperparameters
             restored_args = ArgsFromCheckpoint(dict(self.hparams))
             self.args = restored_args
+            
+            # Initialize model components if dims was provided during init but 
+            # model components weren't initialized yet
+            if self.dims is not None and self.ts_model is None:
+                logging.info("Initializing model components from checkpoint with provided dims")
+                self.init_model()
+            # If self.dims is None, check if we need to extract it from the state_dict
+            elif self.dims is None and 'hyper_parameters' in checkpoint:
+                # Try to extract dims from the checkpoint's hyperparameters
+                if 'dims' in checkpoint['hyper_parameters']:
+                    self.dims = checkpoint['hyper_parameters']['dims']
+                    logging.info("Restored dims from checkpoint hyperparameters")
+                    # Initialize model components with the restored dims
+                    self.init_model()
+                else:
+                    logging.warning("No dims in checkpoint hyperparameters, using defaults")
 
 
 
