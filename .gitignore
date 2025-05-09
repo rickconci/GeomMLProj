@@ -6,6 +6,7 @@ temp_dfs_lite/
 wandb/
 *__pycache__/
 *data/
+!data_scripts/preprocess_data/
 .env 
 lightning_logs/
 checkpoints/
