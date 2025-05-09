@@ -38,9 +38,8 @@ from models.main_models import KEDGN, DSEncoderWithWeightedSum
 from models.models_rd import Raindrop_v2
 from models.models_utils import ProjectionHead
 
-from run_contrastive.ContrastiveDataloaderLighting import ContrastiveDataModule
-from run_multitask.RaindropDSMultitask_lightning import RaindropMultitaskModel
-from run_multitask.metrics_saver import MetricsSaverCallback
+from ContrastiveDataloaderLighting import ContrastiveDataModule
+from RaindropContrastive_lightning import RaindropContrastiveModel
 
 device = get_device()
 
@@ -89,7 +88,7 @@ def main(args):
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(os.path.join(logs_dir, f'multitask_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')),
+                logging.FileHandler(os.path.join(logs_dir, f'contrastive_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')),
                 logging.StreamHandler()
             ]
         )
@@ -118,14 +117,14 @@ def main(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     # Log key parameters and directories
-    logging.info(f"Starting multitask training with:")
+    logging.info(f"Starting contrastive training with:")
     logging.info(f"  Working directory: {os.getcwd()}")
     logging.info(f"  Checkpoint directory (abs): {args.checkpoint_dir}")
     logging.info(f"  Epochs: {args.epochs}")
     logging.info(f"  Batch size: {args.batch_size}")
     logging.info(f"  Learning rate: {args.lr}")
     logging.info(f"  Projection dimension: {args.projection_dim}")
-    logging.info(f"  Model type: {args.model_type}")
+    logging.info(f"  Use PHEcode loss: {args.use_phecode_loss}")
     
     # Initialize data module
     data_module = ContrastiveDataModule(
@@ -133,7 +132,7 @@ def main(args):
         temp_dfs_path=args.temp_dfs_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        task_mode='MULTITASK'
+        task_mode='CONTRASTIVE'
     )
 
     dims = {
@@ -143,56 +142,15 @@ def main(args):
         'ds_emb_dim': 768,
         'values_shape': (args.batch_size, 80, 80), # (batch_size, timestamps, variables_num)
         'phecode_size': 1788,
+        'phecode_loss_weight': 0.2,
         'sensor_wise_mask': True
     }
     
  
-    model = RaindropMultitaskModel(args, dims=dims)
+    model = RaindropContrastiveModel(args, dims=dims)
     
     # Configure callbacks
     callbacks = []
-    
-    # Model checkpoint callback
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=args.checkpoint_dir,
-        filename=f"multitask_{args.model_type}_" + "{epoch:02d}-{val_total_loss:.4f}",
-        monitor='val_total_loss',
-        mode='min',
-        save_top_k=1 if not args.save_all_checkpoints else -1,
-        save_last=True,
-        verbose=True,
-        every_n_epochs=1,  # Save checkpoint every epoch
-        save_on_train_epoch_end=True  # Ensure it saves at the end of training epoch
-    )
-    callbacks.append(checkpoint_callback)
-    
-    # Log checkpoint configuration
-    logging.info(f"Checkpoint configuration:")
-    logging.info(f"  Directory: {checkpoint_callback.dirpath}")
-    logging.info(f"  Filename template: {checkpoint_callback.filename}")
-    logging.info(f"  Monitor: {checkpoint_callback.monitor}")
-    logging.info(f"  Save top k: {checkpoint_callback.save_top_k}")
-    logging.info(f"  Save last: {checkpoint_callback.save_last}")
-    
-    # Early stopping callback if enabled
-    if args.early_stopping:
-        early_stop_callback = EarlyStopping(
-            monitor='val_total_loss',
-            mode='min',
-            patience=args.patience,
-            verbose=True
-        )
-        callbacks.append(early_stop_callback)
-    
-    # Add metrics saver callback if enabled
-    if args.results_csv:
-        metrics_saver = MetricsSaverCallback(
-            csv_path=args.results_csv,
-            model_type=args.model_type,
-            append=True
-        )
-        callbacks.append(metrics_saver)
-        logging.info(f"Will save validation metrics to {args.results_csv}")
     
     # Configure logger
     logger = None
@@ -251,31 +209,20 @@ def main(args):
     
   
     
-    # Get checkpoint path - try best first, then last if best not available
-    best_model_path = checkpoint_callback.best_model_path
-    if best_model_path:
-        logging.info(f"Best model saved to: {best_model_path}")
-        checkpoint_path = best_model_path
-    elif hasattr(checkpoint_callback, 'last_model_path') and checkpoint_callback.last_model_path:
-        last_model_path = checkpoint_callback.last_model_path
-        logging.info(f"Best model not found, using last model: {last_model_path}")
-        checkpoint_path = last_model_path
-
-
+ 
 if __name__ == "__main__":
     """Main entry point for the script"""
-    parser = argparse.ArgumentParser(description='Multitask learning for EHR data')
+    parser = argparse.ArgumentParser(description='Contrastive learning for EHR data')
     
     # General arguments
     parser.add_argument('--data_path', type=str, default='/path/to/mimic/data', help='Path to MIMIC-IV data')
     parser.add_argument('--temp_dfs_path', type=str, default='temp_dfs_lite', help='Path to cache directory')
-    parser.add_argument('--model_type', type=str, choices=['DS_only', 'TS_only', 'DS_TS_concat'], 
-                        default='DS_only', help='Model type')
+    parser.add_argument('--model_type', type=str, choices=['raindrop_v2'], default='raindrop_v2', help='Model type')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers')
+    parser.add_argument('--num_workers', type=int, default=12, help='Number of dataloader workers')
     
     # Model specific arguments
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
@@ -288,9 +235,13 @@ if __name__ == "__main__":
     parser.add_argument('--sensor_wise_mask', type=bool, default=True, help='Use sensor-wise masking (defaults to True)')
     parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads')
     
-    # Encoder arguments
+    # Contrastive learning arguments
+    parser.add_argument('--contrastive_method', type=str, default='clip', choices=['clip', 'infonce'], 
+                        help='Contrastive learning method')
     parser.add_argument('--pooling_type', type=str, default='attention', choices=['weighted_sum', 'attention'],
                         help='Pooling type for discharge summary encoder')
+    parser.add_argument('--temperature', type=float, default=0.07, 
+                        help='Temperature parameter for contrastive loss')
     
     # Training arguments
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
@@ -301,24 +252,24 @@ if __name__ == "__main__":
     
     # Logging arguments
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
-    parser.add_argument('--wandb_project', type=str, default='GeomML_Multitask', help='WandB project name')
+    parser.add_argument('--wandb_project', type=str, default='GeomML_Contrastive', help='WandB project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity name')
     
     # Lightning specific arguments
     parser.add_argument('--accelerator', type=str, default='auto', help='Accelerator to use (auto, cpu, gpu, tpu)')
     parser.add_argument('--precision', type=str, default='32', help='Precision for training (16, 32, 64)')
-    parser.add_argument('--strategy', type=str, default='auto', 
+    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_true', 
                         choices=['ddp', 'ddp_spawn','auto', 'ddp_find_unused_parameters_true'], 
                         help='Distributed training strategy')
     parser.add_argument('--devices', type=int, default=None, help='Number of devices to use')
+    
+    # New argument for PHEcode loss
+    parser.add_argument('--use_phecode_loss', type=lambda x: x.lower() in ['true', 't', 'yes', 'y', '1'], 
+                        default=True, help='Enable PHEcode auxiliary loss (true/false)')
     
     # Add lightning specific parameters
     parser.add_argument('--check_val_every_n_epoch', type=int, default=3, help='Run validation every n epochs')
     parser.add_argument('--accumulate_grad_batches', type=int, default=2, help='Accumulate gradients over n batches')
     parser.add_argument('--fast_dev_run', action='store_true', help='Run a single training and validation batch for testing')
-    
-    # Add results CSV path
-    parser.add_argument('--results_csv', type=str, default=None, help='Path to CSV file to save validation metrics')
-    
     args = parser.parse_args()
     main(args)
