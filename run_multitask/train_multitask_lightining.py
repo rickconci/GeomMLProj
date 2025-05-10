@@ -101,6 +101,9 @@ def main(args):
             handlers=[logging.StreamHandler()]
         )
     
+    # Debug log the preloading flag values
+    logging.info(f"STARTUP FLAGS: preload_to_memory={args.preload_to_memory}, preload_to_gpu={args.preload_to_gpu}")
+    
     # Set random seeds for reproducibility
     seed_everything(args.seed)
     
@@ -133,8 +136,28 @@ def main(args):
         temp_dfs_path=args.temp_dfs_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        task_mode='MULTITASK'
+        task_mode='MULTITASK',
+        preload_to_memory=args.preload_to_memory,
+        preload_to_gpu=args.preload_to_gpu
     )
+
+    # Log data loading configuration
+    if is_main_process:
+        preload_status = "No preloading"
+        if args.preload_to_memory:
+            if args.preload_to_gpu:
+                preload_status = f"Preloading to GPU memory using optimized chunked transfers"
+            else:
+                preload_status = f"Preloading to CPU memory"
+        elif args.preload_to_gpu:
+            logging.warning("--preload_to_gpu flag ignored because --preload_to_memory is not set")
+            preload_status = "No preloading (--preload_to_gpu ignored without --preload_to_memory)"
+        
+        logging.info(f"Data loading configuration:")
+        logging.info(f"  Preload status: {preload_status}")
+        logging.info(f"  Batch size: {args.batch_size}")
+        logging.info(f"  Number of workers: {args.num_workers}")
+        logging.info(f"  Distributed: {args.strategy != 'auto' or get_lightning_devices(args.devices) > 1}")
 
     dims = {
         'variables_num': 80,
@@ -276,6 +299,12 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers')
+    
+    # Add new arguments for preloading data
+    parser.add_argument('--preload_to_memory', action='store_true', 
+                        help='Preload all data to memory (each rank will only load its own shard in distributed mode)')
+    parser.add_argument('--preload_to_gpu', action='store_true', 
+                        help='Preload data directly to GPU memory using optimized chunked transfers with CUDA streams (requires --preload_to_memory)')
     
     # Model specific arguments
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')

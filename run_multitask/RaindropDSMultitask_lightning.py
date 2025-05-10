@@ -92,50 +92,53 @@ class RaindropMultitaskModel(pl.LightningModule):
         """Initialize Raindrop_v2 model with multiple task heads"""
         logging.info(f"Initializing Raindrop_v2 model for {self.args.model_type} configuration")
         
-        # Global structure is fully connected
-        global_structure = torch.ones(self.dims['variables_num'], self.dims['variables_num'])
-        # Create the base Raindrop_v2 model
-        self.ts_model = Raindrop_v2(
-            d_inp=self.dims['variables_num'], 
-            d_model=self.args.d_model,
-            nhead=self.args.num_heads,
-            nhid=self.args.hidden_dim,
-            nlayers=self.args.nlayers,
-            dropout=0.3,
-            max_len=self.dims['timestamps'],
-            d_static=self.dims['d_static'],
-            n_classes=1,  
-            global_structure=global_structure,
-            sensor_wise_mask=self.dims['sensor_wise_mask'],
-            static= self.dims['d_static']
-        )
+        if self.args.model_type in ['TS_only', 'DS_TS_concat']:
+            # Global structure is fully connected
+            global_structure = torch.ones(self.dims['variables_num'], self.dims['variables_num'])
+            # Create the base Raindrop_v2 model
+            self.ts_model = Raindrop_v2(
+                d_inp=self.dims['variables_num'], 
+                d_model=self.args.d_model,
+                nhead=self.args.num_heads,
+                nhid=self.args.hidden_dim,
+                nlayers=self.args.nlayers,
+                dropout=0.3,
+                max_len=self.dims['timestamps'],
+                d_static=self.dims['d_static'],
+                n_classes=1,  
+                global_structure=global_structure,
+                sensor_wise_mask=self.dims['sensor_wise_mask'],
+                static= self.dims['d_static']
+            )
+
+            # Create projection heads
+            raindrop_output_dim = self.args.d_model + 16  # base model + positional encoding
+            if self.args.sensor_wise_mask:
+                raindrop_output_dim = self.dims['variables_num'] * (self.args.d_model // self.dims['variables_num'] + 16)
+            if self.dims['d_static'] > 0:
+                raindrop_output_dim += self.dims['variables_num']
+
+            self.ts_projection = ProjectionHead(
+                input_dim=raindrop_output_dim,
+                hidden_dim=self.args.hidden_dim,
+                output_dim=self.args.projection_dim
+            )
+
+        if self.args.model_type in ['DS_only', 'DS_TS_concat']:
+            # Create the discharge summary encoder
+            self.ds_encoder = DSEncoderWithWeightedSum(
+                hidden_dim=self.args.hidden_dim,
+                projection_dim=self.args.projection_dim,
+                pooling_type=self.args.pooling_type,
+                num_heads=self.args.num_heads
+            )
         
-        # Create the discharge summary encoder
-        self.ds_encoder = DSEncoderWithWeightedSum(
-            hidden_dim=self.args.hidden_dim,
-            projection_dim=self.args.projection_dim,
-            pooling_type=self.args.pooling_type,
-            num_heads=self.args.num_heads
-        )
-        
-        # Create projection heads
-        raindrop_output_dim = self.args.d_model + 16  # base model + positional encoding
-        if self.args.sensor_wise_mask:
-            raindrop_output_dim = self.dims['variables_num'] * (self.args.d_model // self.dims['variables_num'] + 16)
-        if self.dims['d_static'] > 0:
-            raindrop_output_dim += self.dims['variables_num']
-        
-        self.ts_projection = ProjectionHead(
-            input_dim=raindrop_output_dim,
-            hidden_dim=self.args.hidden_dim,
-            output_dim=self.args.projection_dim
-        )
-        
-        self.text_projection = ProjectionHead(
-            input_dim=self.args.projection_dim,
-            hidden_dim=self.args.hidden_dim,
-            output_dim=self.args.projection_dim
-        )
+    
+            self.text_projection = ProjectionHead(
+                input_dim=self.args.projection_dim,
+                hidden_dim=self.args.hidden_dim,
+                output_dim=self.args.projection_dim
+            )
 
         # Determine the input size for the prediction heads based on model type
         if self.args.model_type == 'DS_TS_concat':
@@ -312,11 +315,11 @@ class RaindropMultitaskModel(pl.LightningModule):
         
         # Log losses
         batch_size = batch_data['P'].shape[1]
-        self.log('train_mortality_loss', mortality_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log('train_readmission_loss', readmission_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log('train_current_phecode_loss', current_phecode_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log('train_next_phecode_loss', next_phecode_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log('train_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log('train_mortality_loss', mortality_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+        self.log('train_readmission_loss', readmission_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+        self.log('train_current_phecode_loss', current_phecode_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+        self.log('train_next_phecode_loss', next_phecode_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+        self.log('train_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
         
         return total_loss
     
@@ -577,7 +580,7 @@ class RaindropMultitaskModel(pl.LightningModule):
             try:
                 # Prepare targets
                 current_phecode_targets, valid_samples = prepare_phecode_targets(
-                    batch_data, self.device, self.phe_code_size
+                    batch_data, self.device, self.phecode_size
                 )
                 
                 if current_phecode_targets is not None:
@@ -628,7 +631,7 @@ class RaindropMultitaskModel(pl.LightningModule):
                         'next_len': batch_data['next_phecode_len']
                     }, 
                     self.device, 
-                    self.phe_code_size
+                    self.phecode_size
                 )
                 
                 if next_phecode_targets is not None:

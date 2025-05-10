@@ -3,11 +3,15 @@ import torch
 import numpy as np
 import pytorch_lightning as pl
 import logging
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, DistributedSampler
 from data_scripts.data_lite import MIMICContrastivePairsDatasetLite
 from typing import Optional, Union, List, Dict, Any
 from train_utils import get_device
 from dataloader_lite import custom_collate_fn, get_var_embeddings
+
+from tqdm.auto import tqdm
+from pathlib import Path
+import time
 
 
 def float32_collate_fn(batch):
@@ -38,7 +42,9 @@ class ContrastiveDataModule(pl.LightningDataModule):
         T: int = 80,
         test_ds_only: bool = False,
         collate_fn = None,
-        drop_last: bool = False
+        drop_last: bool = False,
+        preload_to_memory: bool = False,
+        preload_to_gpu: bool = False
     ):
         """
         Initialize the DataModule with configuration parameters.
@@ -55,6 +61,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
             test_ds_only: Flag to only use discharge summaries for test data
             collate_fn: Optional custom collate function
             drop_last: Whether to drop the last incomplete batch
+            preload_to_memory: Whether to preload all data into memory
+            preload_to_gpu: Whether to preload all data to GPU (requires preload_to_memory=True)
         """
         super().__init__()
         self.data_path = data_path
@@ -68,6 +76,15 @@ class ContrastiveDataModule(pl.LightningDataModule):
         self.test_ds_only = test_ds_only
         self.collate_fn = collate_fn or float32_collate_fn
         self.drop_last = drop_last
+        
+        # Debug log the incoming flag values
+        logging.info(f"DataModule init: received preload_to_memory={preload_to_memory}, preload_to_gpu={preload_to_gpu}")
+        
+        self.preload_to_memory = preload_to_memory
+        self.preload_to_gpu = preload_to_gpu and preload_to_memory
+        
+        # Debug log the effective flag values after processing
+        logging.info(f"DataModule init: effective preload_to_memory={self.preload_to_memory}, preload_to_gpu={self.preload_to_gpu}")
         
         # These will be set in the setup method
         self.train_dataset = None
@@ -117,6 +134,144 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 T=self.T,
                 test_ds_only=self.test_ds_only
             )
+            
+            # Preload training data (only this rank's shard) if specified
+            if self.preload_to_memory:
+                rank = getattr(self.trainer, "global_rank", 0)
+                world_size = getattr(self.trainer, "world_size", 1)
+
+                logging.info(f"[rank {rank}] Preloading training shard to "
+                             f"{'GPU' if self.preload_to_gpu else 'CPU'} memory …")
+                logging.info(f"[rank {rank}] Debug: preload_to_memory={self.preload_to_memory}, "
+                             f"preload_to_gpu={self.preload_to_gpu}, cuda_available={torch.cuda.is_available()}")
+
+                # -------- Rank‑specific cache path --------
+                cache_dir = Path(self.temp_dfs_path) / "preload_cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_file = cache_dir / f"train_rank{rank}.pt"
+
+                # -------- Fast path: load cached shard if present --------
+                if cache_file.is_file():
+                    logging.info(f"[rank {rank}] Loading shard from {cache_file} …")
+                    load_start = time.time()
+                    cached_shard = torch.load(cache_file, map_location=device)
+                    load_seconds = time.time() - load_start
+                    logging.info(f"[rank {rank}] Loaded {len(cached_shard)} samples in {load_seconds:.1f}s")
+
+                    # If GPU preload requested and tensors are still on CPU, move them in chunks
+                    if self.preload_to_gpu and all(
+                        torch.is_tensor(next(iter(s.values()))) and next(iter(s.values())).device.type == "cpu"
+                        for s in cached_shard[:1]
+                    ):
+                        preload_stream = torch.cuda.Stream(device=device)
+                        CHUNK_SIZE = 256
+                        chunk = []
+                        for sample in tqdm(
+                            cached_shard,
+                            desc=f"[rank {rank}] Moving cached shard to GPU",
+                            unit="sample",
+                        ):
+                            chunk.append(sample)
+                            if len(chunk) >= CHUNK_SIZE:
+                                with torch.cuda.stream(preload_stream):
+                                    for s in chunk:
+                                        for k, v in s.items():
+                                            if torch.is_tensor(v):
+                                                s[k] = v.to(device, non_blocking=True)
+                                torch.cuda.current_stream(device).wait_stream(preload_stream)
+                                chunk = []
+                        # final partial chunk
+                        if len(chunk) > 0:
+                            with torch.cuda.stream(preload_stream):
+                                for s in chunk:
+                                    for k, v in s.items():
+                                        if torch.is_tensor(v):
+                                            s[k] = v.to(device, non_blocking=True)
+                            torch.cuda.current_stream(device).wait_stream(preload_stream)
+                    # Replace dataset and skip the slow build path
+                    self.train_dataset = PreloadedDataset(cached_shard)
+                    return
+
+                # 1. Build a deterministic sampler to get this rank's indices
+                shard_sampler = DistributedSampler(
+                    self.train_dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
+                shard_indices = list(shard_sampler)
+                shard_dataset = torch.utils.data.Subset(self.train_dataset, shard_indices)
+
+                # 2. Choose device for optional GPU pinning
+                device = (
+                    torch.device("cuda", self.trainer.local_rank)
+                    if self.preload_to_gpu and torch.cuda.is_available()
+                    else torch.device("cpu")
+                )
+                
+                logging.info(f"[rank {rank}] Selected device for preloading: {device}")
+                # Create a dedicated CUDA stream for async H2D copies (if GPU preloading)
+                preload_stream = (
+                    torch.cuda.Stream(device=device)
+                    if self.preload_to_gpu and torch.cuda.is_available()
+                    else None
+                )
+                CHUNK_SIZE = 256  # number of samples per CUDA copy batch
+
+                # 3. Stream the shard once and cache every sample, showing progress bar
+                temp_loader = DataLoader(
+                    shard_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=lambda x: x[0],
+                )
+
+                cached_shard = []
+                chunk = []
+                for sample in tqdm(
+                    temp_loader,
+                    desc=f"[rank {rank}] Preloading shard",
+                    total=len(shard_indices),
+                    unit="sample",
+                ):
+                    chunk.append(sample)
+                    # When we've accumulated CHUNK_SIZE samples, copy all tensors in the chunk at once
+                    if preload_stream is not None and len(chunk) >= CHUNK_SIZE:
+                        with torch.cuda.stream(preload_stream):
+                            for s in chunk:
+                                for key, val in s.items():
+                                    if torch.is_tensor(val):
+                                        s[key] = val.to(device, non_blocking=True)
+                        # Ensure the default stream waits for preload_stream
+                        torch.cuda.current_stream(device).wait_stream(preload_stream)
+                        cached_shard.extend(chunk)
+                        chunk = []
+                # Copy any remaining samples in the last partial chunk
+                if preload_stream is not None and len(chunk) > 0:
+                    with torch.cuda.stream(preload_stream):
+                        for s in chunk:
+                            for key, val in s.items():
+                                if torch.is_tensor(val):
+                                    s[key] = val.to(device, non_blocking=True)
+                    torch.cuda.current_stream(device).wait_stream(preload_stream)
+                # Append leftover samples (if no GPU preloading, just extend)
+                cached_shard.extend(chunk)
+
+                # Save CPU copy for future fast loads
+                cpu_copy = [
+                    {k: v.cpu() if torch.is_tensor(v) else v for k, v in sample.items()}
+                    for sample in cached_shard
+                ]
+                torch.save(cpu_copy, cache_file)
+                logging.info(f"[rank {rank}] Saved shard to {cache_file}")
+
+                # 4. Replace the training dataset with the cached shard
+                self.train_dataset = PreloadedDataset(cached_shard)
+                logging.info(f"[rank {rank}] Cached {len(cached_shard)} samples.")
+            # Preload validation data if needed
+                
         elif stage == 'validate':
             # Only create validation dataset
             self.val_dataset = MIMICContrastivePairsDatasetLite(
@@ -128,6 +283,31 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 T=self.T,
                 test_ds_only=self.test_ds_only
             )
+            
+            # Preload validation data if specified
+            if self.preload_to_memory:
+                logging.info("Preloading validation data to memory...")
+                device = torch.device('cuda' if self.preload_to_gpu and torch.cuda.is_available() else 'cpu')
+                
+                # Create a temporary dataloader with batch size 1
+                temp_loader = DataLoader(
+                    self.val_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=lambda x: x[0]
+                )
+                
+                all_data = []
+                for batch in temp_loader:
+                    if self.preload_to_gpu:
+                        for key in batch:
+                            if isinstance(batch[key], torch.Tensor):
+                                batch[key] = batch[key].to(device)
+                    all_data.append(batch)
+                
+                self.val_dataset = PreloadedDataset(all_data)
+                logging.info(f"Preloaded {len(all_data)} validation samples to {'GPU' if self.preload_to_gpu else 'memory'}")
         
         if stage == 'test' or stage is None:
             # Test dataset
@@ -141,43 +321,109 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 test_ds_only=self.test_ds_only
             )
             
+            # Preload test data if specified
+            if self.preload_to_memory:
+                logging.info("Preloading test data to memory...")
+                device = torch.device('cuda' if self.preload_to_gpu and torch.cuda.is_available() else 'cpu')
+                
+                # Create a temporary dataloader with batch size 1
+                temp_loader = DataLoader(
+                    self.test_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=lambda x: x[0]
+                )
+                
+                all_data = []
+                for batch in temp_loader:
+                    if self.preload_to_gpu:
+                        for key in batch:
+                            if isinstance(batch[key], torch.Tensor):
+                                batch[key] = batch[key].to(device)
+                    all_data.append(batch)
+                
+                self.test_dataset = PreloadedDataset(all_data)
+                logging.info(f"Preloaded {len(all_data)} test samples to {'GPU' if self.preload_to_gpu else 'memory'}")
+            
             
     def train_dataloader(self):
         """Return the training dataloader"""
+        # Check if we're in a distributed setting
+        trainer_is_distributed = self.trainer.world_size > 1 if hasattr(self, 'trainer') else False
+
+        if trainer_is_distributed and not self.preload_to_memory:
+            sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.trainer.world_size,
+                rank=self.trainer.global_rank,
+                shuffle=True
+            )
+            shuffle = False
+        else:
+            sampler = None
+            shuffle = not trainer_is_distributed  # keep deterministic order per rank
+
+        loader_args = {
+            'batch_size': self.batch_size,
+            'sampler': sampler,
+            'shuffle': shuffle,
+            'num_workers': self.num_workers if not self.preload_to_memory else 0,  # No workers needed if preloaded
+            'collate_fn': self.collate_fn,
+            'drop_last': self.drop_last,
+            'pin_memory': True and not self.preload_to_gpu,  # No need for pin_memory if already on GPU
+        }
+
+        # Add prefetch_factor and persistent_workers only if using workers
+        if self.num_workers > 0 and not self.preload_to_memory:
+            loader_args['persistent_workers'] = True
+            loader_args['prefetch_factor'] = 4
+
         return DataLoader(
             self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            collate_fn=self.collate_fn,
-            #prefetch_factor=4,
-            #persistent_workers=True,
-            #pin_memory=True
+            **loader_args
         )
     
     def val_dataloader(self):
         """Return the validation dataloader"""
+        loader_args = {
+            'batch_size': self.batch_size,
+            'shuffle': False,
+            'num_workers': self.num_workers if not self.preload_to_memory else 0,
+            'collate_fn': self.collate_fn,
+            'drop_last': self.drop_last,
+            'pin_memory': True and not self.preload_to_gpu,
+        }
+        
+        # Add prefetch_factor and persistent_workers only if using workers
+        if self.num_workers > 0 and not self.preload_to_memory:
+            loader_args['persistent_workers'] = True
+            loader_args['prefetch_factor'] = 4
+            
         return DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=self.collate_fn,
-            drop_last=self.drop_last,
-            #pin_memory=True,
-            #persistent_workers=True
+            **loader_args
         )
     
     def test_dataloader(self):
         """Return the test dataloader"""
+        loader_args = {
+            'batch_size': self.batch_size,
+            'shuffle': False,
+            'num_workers': self.num_workers if not self.preload_to_memory else 0,
+            'collate_fn': self.collate_fn,
+            'drop_last': self.drop_last,
+            'pin_memory': True and not self.preload_to_gpu,
+        }
+        
+        # Add prefetch_factor and persistent_workers only if using workers
+        if self.num_workers > 0 and not self.preload_to_memory:
+            loader_args['persistent_workers'] = True
+            loader_args['prefetch_factor'] = 4
+            
         return DataLoader(
             self.test_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=self.collate_fn,
-            drop_last=self.drop_last,
-            #pin_memory=True
+            **loader_args
         )
     
     def get_var_embeddings(self):
@@ -185,6 +431,17 @@ class ContrastiveDataModule(pl.LightningDataModule):
         return self.var_embeddings
 
 
+class PreloadedDataset(torch.utils.data.Dataset):
+    """Dataset that returns preloaded data directly from memory/GPU"""
+    
+    def __init__(self, data):
+        self.data = data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
 
 
 def get_model_dimensions(data_module):

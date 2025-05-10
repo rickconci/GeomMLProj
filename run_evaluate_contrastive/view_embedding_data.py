@@ -328,11 +328,11 @@ def find_available_epochs(model_dir):
 def main():
     parser = argparse.ArgumentParser(description="View embedding data for a specific model and epoch")
     parser.add_argument("--embeddings_root", type=str, 
-                        default="/Users/riccardoconci/Local_documents/!!GeomML_2025/GeomMLProj/Embeddings",
+                        default="/Users/riccardoconci/Local_documents/!!GeomML_2025/GeomMLProj/run_evaluate_contrastive/Embeddings",
                         help="Root directory containing model directories")
     parser.add_argument("--model", type=str, default='bs128_lr0.0005_seed42_proj256_temp0.07_phe',
                         help="Model directory name (e.g., 'bs128_lr0.0005_seed42_proj256_temp0.07_phe')")
-    parser.add_argument("--epoch", type=int, default=7,
+    parser.add_argument("--epoch", type=int, default=0,
                         help="Epoch number to analyze")
     parser.add_argument("--load_data", action="store_true",
                         help="Actually load data into memory to compute statistics (might be memory intensive)")

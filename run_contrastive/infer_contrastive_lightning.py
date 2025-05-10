@@ -70,35 +70,19 @@ def init_wandb(args):
 
 
 def main(args):
-    # Set up logging only on main process (rank 0)
-    is_main_process = os.environ.get('LOCAL_RANK', '0') == '0'
+    # Set up logging
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(args.output_dir)), 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    if is_main_process:
-        # Convert checkpoint_dir to absolute path if it isn't already
-        checkpoint_dir = os.path.abspath(args.checkpoint_dir)
-        # The logs directory should be at the same level as the checkpoint directory
-        logs_dir = os.path.join(os.path.dirname(checkpoint_dir), 'logs')
-        os.makedirs(logs_dir, exist_ok=True)
-        
-        # Debug print the paths
-        print(f"Checkpoint dir (abs): {checkpoint_dir}")
-        print(f"Logs dir (abs): {logs_dir}")
-
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(os.path.join(logs_dir, f'contrastive_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')),
-                logging.StreamHandler()
-            ]
-        )
-    else:
-        # For non-main processes, just set up basic console logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[logging.StreamHandler()]
-        )
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(logs_dir, f'infer_contrastive_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')),
+            logging.StreamHandler()
+        ]
+    )
     
     # Set random seeds for reproducibility
     seed_everything(args.seed)
@@ -106,25 +90,14 @@ def main(args):
     # Force sensor_wise_mask to be True
     args.sensor_wise_mask = True
     
-    # Disable debug printing
-    toggle_debug(False)
+    # Check if checkpoint exists
+    if not os.path.exists(args.checkpoint_path):
+        logging.error(f"Checkpoint not found at: {args.checkpoint_path}")
+        return
     
-    init_wandb(args)
-    
-    args.checkpoint_dir = os.path.abspath(args.checkpoint_dir)
-    
-    # Create directories
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    
-    # Log key parameters and directories
-    logging.info(f"Starting contrastive training with:")
-    logging.info(f"  Working directory: {os.getcwd()}")
-    logging.info(f"  Checkpoint directory (abs): {args.checkpoint_dir}")
-    logging.info(f"  Epochs: {args.epochs}")
-    logging.info(f"  Batch size: {args.batch_size}")
-    logging.info(f"  Learning rate: {args.lr}")
-    logging.info(f"  Projection dimension: {args.projection_dim}")
-    logging.info(f"  Use PHEcode loss: {args.use_phecode_loss}")
+    logging.info(f"Starting inference with checkpoint: {args.checkpoint_path}")
+    logging.info(f"Output directory: {args.output_dir}")
+    logging.info(f"Batch size: {args.batch_size}")
     
     # Initialize data module
     data_module = ContrastiveDataModule(
@@ -134,142 +107,165 @@ def main(args):
         num_workers=args.num_workers,
         task_mode='CONTRASTIVE'
     )
-
-    dims = {
-        'variables_num': 80,
-        'timestamps': 80,
-        'd_static': 83,
-        'ds_emb_dim': 768,
-        'values_shape': (args.batch_size, 80, 80), # (batch_size, timestamps, variables_num)
-        'phecode_size': 1788,
-        'phecode_loss_weight': 0.2,
-        'sensor_wise_mask': True
-    }
     
- 
-    model = RaindropContrastiveModel(args, dims=dims)
+    # Setup data module
+    data_module.setup()
     
-    # Configure callbacks
-    callbacks = []
+    # Load pretrained model
+    logging.info(f"Loading model from checkpoint: {args.checkpoint_path}")
+    model = RaindropContrastiveModel.load_from_checkpoint(args.checkpoint_path)
     
-    # Configure logger
-    logger = None
-    if args.use_wandb:
-        # Only initialize WandB logger on main process (rank 0)
-        is_main_process = os.environ.get('LOCAL_RANK', '0') == '0'
-        
-        if is_main_process:
-            try:
-                dotenv.load_dotenv('dot_env.txt')
-                wandb.login(key=os.getenv("WANDB_API_KEY"))
-                logger = WandbLogger(
-                    project=args.wandb_project,
-                    entity=args.wandb_entity,
-                    log_model=True,
-                    save_dir=args.checkpoint_dir
-                )
-                logger.log_hyperparams(vars(args))
-            except Exception as e:
-                logging.warning(f"Failed to initialize wandb: {e}")
-                logging.info("Continuing without wandb logging")
-        else:
-            logging.info("Non-main process: Not creating WandB logger")
+    # Log model architecture
+    logging.info(f"Model architecture loaded successfully")
     
-    # Force everything to float32 for MPS compatibility
-    # Override any specified precision
-    forced_precision = "32" if torch.backends.mps.is_available() else args.precision
-    if torch.backends.mps.is_available() and args.precision != "32":
-        logging.warning(f"Overriding precision={args.precision} to precision=32 for MPS compatibility")
-    
+    # Make sure to run on a single device for validation to get all embeddings
     trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        callbacks=callbacks,
-        logger=logger,
         accelerator=args.accelerator,
-        precision=forced_precision,
-        strategy=args.strategy,
-        sync_batchnorm=True,
-        devices= list(range(get_lightning_devices(args.devices))),
-        check_val_every_n_epoch=args.check_val_every_n_epoch,
-        enable_checkpointing=True,
-        enable_model_summary=True,  
-        log_every_n_steps=10,
-        profiler = 'simple',
-        accumulate_grad_batches=args.accumulate_grad_batches,
-        #num_sanity_val_steps=0,  # Disable sanity validation completely
-        limit_val_batches=0.1 if args.fast_dev_run else 1.0  # Limit validation batches in normal runs
+        devices=1,  # Force single device
+        precision="32",  # Use 32-bit precision for compatibility
+        strategy="auto",  # Use auto strategy for single device
+        enable_model_summary=True,
     )
     
+    # Override the embeddings_dir in the model to use our specified output directory
+    embeddings_path = os.path.join(args.output_dir, f"embeddings_validation_full")
+    os.makedirs(embeddings_path, exist_ok=True)
+    
+    # Modify validation_step and on_validation_epoch_end in the model instance
+    original_validation_step = model.validation_step
+    original_validation_epoch_end = model.on_validation_epoch_end
+    
+    # Replace the validation_step to save embeddings for all samples
+    def new_validation_step(self, batch, batch_idx):
+        # Skip sanity checking
+        if self.trainer.sanity_checking:
+            return None
+            
+        # Prepare batch data
+        batch_data = self.prepare_batch(batch)
+        if batch_data is None:
+            return None
+        
+        # Forward pass through model to get embeddings (with no gradients)
+        with torch.no_grad():
+            ts_proj, text_proj, _ = self.model_forward(batch_data)
+        
+        # Store results in memory-mapped arrays
+        if not hasattr(self, 'val_embeddings'):
+            # Initialize memory-mapped arrays on first batch
+            # Save directly to the specified output directory
+            self.embeddings_dir = embeddings_path
+            logging.info(f"Saving embeddings to: {self.embeddings_dir}")
+            
+            # Get validation dataset size
+            val_size = len(self.trainer.datamodule.val_dataset)
+            logging.info(f"Creating memory-mapped arrays for validation dataset of size {val_size}")
+            
+            # Get the actual shape of next_idx_padded from the batch
+            next_idx_shape = batch_data['next_idx_padded'].shape
+            logging.info(f"next_idx_padded shape from batch: {next_idx_shape}")
+            
+            # Create memory-mapped arrays
+            self.val_embeddings = {
+                'ts_proj': np.memmap(os.path.join(self.embeddings_dir, 'ts_proj.mmap'), 
+                                   dtype='float32', mode='w+', 
+                                   shape=(val_size, self.args.projection_dim)),
+                'text_proj': np.memmap(os.path.join(self.embeddings_dir, 'text_proj.mmap'), 
+                                     dtype='float32', mode='w+', 
+                                     shape=(val_size, self.args.projection_dim)),
+                'mortality_label': np.memmap(os.path.join(self.embeddings_dir, 'mortality_label.mmap'), 
+                                          dtype='float32', mode='w+', 
+                                          shape=(val_size,)),
+                'readmission_label': np.memmap(os.path.join(self.embeddings_dir, 'readmission_label.mmap'), 
+                                            dtype='float32', mode='w+', 
+                                            shape=(val_size,)),
+                'next_idx_padded': np.memmap(os.path.join(self.embeddings_dir, 'next_idx_padded.mmap'), 
+                                           dtype='int64', mode='w+', 
+                                           shape=(val_size, next_idx_shape[1])),
+                'next_phecode_len': np.memmap(os.path.join(self.embeddings_dir, 'next_phecode_len.mmap'), 
+                                            dtype='int64', mode='w+', 
+                                            shape=(val_size,)),
+            }
+            
+            # Add hadm_id if present in dataset
+            if hasattr(self.trainer.datamodule.val_dataset, 'hadm_ids'):
+                self.val_embeddings['hadm_id'] = np.memmap(os.path.join(self.embeddings_dir, 'hadm_id.mmap'), 
+                                                         dtype='int64', mode='w+', 
+                                                         shape=(val_size,))
+        
+        # Calculate start index for this batch
+        start_idx = batch_idx * self.args.batch_size
+        end_idx = start_idx + ts_proj.shape[0]
+        
+        # Store results directly in memory-mapped arrays
+        self.val_embeddings['ts_proj'][start_idx:end_idx] = ts_proj.cpu().numpy()
+        self.val_embeddings['text_proj'][start_idx:end_idx] = text_proj.cpu().numpy()
+        self.val_embeddings['mortality_label'][start_idx:end_idx] = batch_data['mortality_label'].cpu().numpy()
+        self.val_embeddings['readmission_label'][start_idx:end_idx] = batch_data['readmission_label'].cpu().numpy()
+        self.val_embeddings['next_idx_padded'][start_idx:end_idx] = batch_data['next_idx_padded'].cpu().numpy()
+        self.val_embeddings['next_phecode_len'][start_idx:end_idx] = batch_data['next_phecode_len'].cpu().numpy()
+        
+        if 'hadm_id' in self.val_embeddings:
+            hadm_id_tensor = batch.get('hadm_id', None)
+            if hadm_id_tensor is not None:
+                self.val_embeddings['hadm_id'][start_idx:end_idx] = hadm_id_tensor.cpu().numpy()
+        
+        if batch_idx % 10 == 0:  # Log progress every 10 batches
+            logging.info(f"Processed validation batch {batch_idx}, samples {start_idx} to {end_idx-1}")
+        
+        return None
+    
+    # Replace the on_validation_epoch_end to save metadata
+    def new_on_validation_epoch_end(self):
+        if hasattr(self, 'val_embeddings'):
+            # Save metadata
+            metadata = {
+                'batch_size': self.args.batch_size,
+                'projection_dim': self.args.projection_dim,
+                'use_phecode_loss': self.use_phecode_loss,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'checkpoint_path': args.checkpoint_path
+            }
+            with open(os.path.join(self.embeddings_dir, 'metadata.json'), 'w') as f:
+                json.dump(metadata, f)
+            
+            # Flush memory-mapped arrays to disk
+            for array in self.val_embeddings.values():
+                array.flush()
+            
+            logging.info(f"Embeddings saved to {self.embeddings_dir}")
+            
+            # Clean up memory-mapped arrays
+            for array in self.val_embeddings.values():
+                del array
+            del self.val_embeddings
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Set new validation methods
+    model.validation_step = new_validation_step.__get__(model, RaindropContrastiveModel)
+    model.on_validation_epoch_end = new_on_validation_epoch_end.__get__(model, RaindropContrastiveModel)
+    
+    # Run validation only
+    logging.info("Starting validation pass...")
+    trainer.validate(model, datamodule=data_module)
+    
+    logging.info("Validation completed. All embeddings should be saved.")
 
-    # Train the model
-    if args.resume_from_checkpoint:
-        trainer.fit(model, data_module, ckpt_path=args.resume_from_checkpoint)
-    else:
-        trainer.fit(model, data_module)
-    
-  
-    
- 
 if __name__ == "__main__":
     """Main entry point for the script"""
-    parser = argparse.ArgumentParser(description='Contrastive learning for EHR data')
+    parser = argparse.ArgumentParser(description='Inference for pretrained contrastive model')
     
     # General arguments
+    parser.add_argument('--checkpoint_path', type=str, required=True, help='Path to the checkpoint file')
+    parser.add_argument('--output_dir', type=str, default='./embeddings', help='Directory to save embeddings')
     parser.add_argument('--data_path', type=str, default='/path/to/mimic/data', help='Path to MIMIC-IV data')
     parser.add_argument('--temp_dfs_path', type=str, default='temp_dfs_lite', help='Path to cache directory')
-    parser.add_argument('--model_type', type=str, choices=['raindrop_v2'], default='raindrop_v2', help='Model type')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--num_workers', type=int, default=12, help='Number of dataloader workers')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
     
-    # Model specific arguments
-    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
-    parser.add_argument('--projection_dim', type=int, default=256, help='Projection dimension')
+    # Hardware specific arguments
+    parser.add_argument('--accelerator', type=str, default='auto', help='Accelerator to use (auto, cpu, gpu)')
     
-    # Raindrop specific arguments
-    parser.add_argument('--d_model', type=int, default=256, help='Dimension of model')
-    parser.add_argument('--nlayers', type=int, default=2, help='Number of transformer layers')
-    parser.add_argument('--global_structure_path', type=str, default=None, help='Path to global structure')
-    parser.add_argument('--sensor_wise_mask', type=bool, default=True, help='Use sensor-wise masking (defaults to True)')
-    parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads')
-    
-    # Contrastive learning arguments
-    parser.add_argument('--contrastive_method', type=str, default='clip', choices=['clip', 'infonce'], 
-                        help='Contrastive learning method')
-    parser.add_argument('--pooling_type', type=str, default='attention', choices=['weighted_sum', 'attention'],
-                        help='Pooling type for discharge summary encoder')
-    parser.add_argument('--temperature', type=float, default=0.07, 
-                        help='Temperature parameter for contrastive loss')
-    
-    # Training arguments
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
-    parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
-    parser.add_argument('--patience', type=int, default=5, help='Patience for early stopping')
-    parser.add_argument('--resume_from_checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--save_all_checkpoints', action='store_true', help='Save checkpoint after every epoch')
-    
-    # Logging arguments
-    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
-    parser.add_argument('--wandb_project', type=str, default='GeomML_Contrastive', help='WandB project name')
-    parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity name')
-    
-    # Lightning specific arguments
-    parser.add_argument('--accelerator', type=str, default='auto', help='Accelerator to use (auto, cpu, gpu, tpu)')
-    parser.add_argument('--precision', type=str, default='32', help='Precision for training (16, 32, 64)')
-    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_true', 
-                        choices=['ddp', 'ddp_spawn','auto', 'ddp_find_unused_parameters_true'], 
-                        help='Distributed training strategy')
-    parser.add_argument('--devices', type=int, default=None, help='Number of devices to use')
-    
-    # New argument for PHEcode loss
-    parser.add_argument('--use_phecode_loss', type=lambda x: x.lower() in ['true', 't', 'yes', 'y', '1'], 
-                        default=True, help='Enable PHEcode auxiliary loss (true/false)')
-    
-    # Add lightning specific parameters
-    parser.add_argument('--check_val_every_n_epoch', type=int, default=3, help='Run validation every n epochs')
-    parser.add_argument('--accumulate_grad_batches', type=int, default=2, help='Accumulate gradients over n batches')
-    parser.add_argument('--fast_dev_run', action='store_true', help='Run a single training and validation batch for testing')
     args = parser.parse_args()
     main(args)
